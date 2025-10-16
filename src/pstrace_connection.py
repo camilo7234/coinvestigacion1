@@ -485,3 +485,102 @@ def ejecutar_sesion_remota_gui(serial: str,
                 log.warning("⚠ Fallo al desconectar instrumento")
         if conn:
             conn.close()            
+
+# ===================================================================================
+# BLOQUE 8: INTEGRACIÓN AUTOMÁTICA CON SERVIDOR IoT
+# ===================================================================================
+
+import json
+import hashlib
+from cliente_iot import cargar_config
+import socket
+import os
+import datetime
+
+def generar_archivo_json_iot(datos: dict, serial: str) -> str:
+    """
+    Genera un archivo JSON con los datos de la medición remota
+    listo para enviar al servidor IoT.
+    """
+    try:
+        carpeta = os.path.join(os.path.dirname(__file__), "..", "archivos_iot")
+        os.makedirs(carpeta, exist_ok=True)
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"CV_{serial}_{timestamp}.json"
+        filepath = os.path.join(carpeta, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(datos, f, default=str, indent=2)
+
+        log.info(f"✓ Archivo JSON IoT generado: {filepath}")
+        return filepath
+    except Exception as e:
+        log.error(f"✗ Error generando archivo JSON IoT: {e}")
+        raise
+
+def enviar_archivo_iot(filepath: str):
+    """
+    Envía un archivo al servidor IoT usando la configuración de cliente_iot.py
+    """
+    try:
+        config = cargar_config()
+        if not config:
+            raise Exception("No se pudo cargar la configuración IoT.")
+
+        host = config["HOST"]
+        port = config["PORT"]
+        size = os.path.getsize(filepath)
+        filename = os.path.basename(filepath)
+
+        checksum = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
+
+        header = json.dumps({
+            "action": "send_file",
+            "filename": filename,
+            "size": size,
+            "checksum": checksum
+        }).encode() + b"\n"
+
+        log.info(f"📡 Conectando a servidor IoT {host}:{port} para enviar {filename}")
+        with socket.create_connection((host, port)) as s:
+            s.sendall(header)
+            ack = s.recv(8)
+            if ack != b"ACK":
+                raise Exception("Servidor no aceptó la transferencia")
+
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    s.sendall(chunk)
+            s.sendall(b"EOF")
+
+        log.info(f"✅ Archivo IoT enviado correctamente: {filename}")
+    except Exception as e:
+        log.error(f"✗ Error enviando archivo IoT: {e}")
+        raise
+
+def ejecutar_sesion_remota_iot(serial: str, method_params: dict, gui_refresh_callback=None):
+    """
+    Wrapper completo para:
+    - Ejecutar sesión remota segura
+    - Guardar en BD
+    - Generar archivo JSON para IoT
+    - Enviar automáticamente al servidor IoT
+    """
+    session_id = ejecutar_sesion_remota_segura(serial, method_params, gui_refresh_callback)
+    try:
+        # 1) Tomar los datos de la sesión ya guardada en BD
+        datos = iniciar_medicion_cv_remota(conectar_con_reintentos(serial), method_params)
+
+        # 2) Generar archivo JSON listo para IoT
+        filepath = generar_archivo_json_iot(datos, serial)
+
+        # 3) Enviar al servidor IoT
+        enviar_archivo_iot(filepath)
+
+        log.info(f"✓ Sesión remota IoT completa para {serial}, ID {session_id}")
+        return session_id
+
+    except Exception as e:
+        log.error(f"✗ Error en ejecución remota IoT para {serial}: {e}")
+        return session_id
