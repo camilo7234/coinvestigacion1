@@ -752,7 +752,6 @@ class Aplicacion(tk.Tk):
         btn_export_ppm.pack(side="right", padx=10, pady=5)
         ToolTip(btn_export_ppm, "Exporta la tabla de clasificación como CSV")
      # ——— Bloque: Pestaña “IoT / Comunicación” ———
-         # ——— Bloque: Pestaña “IoT / Comunicación” ———
     def build_iot_tab(self, parent):
         """
         Crea la pestaña para control del servidor IoT, conexión remota y envío de archivos.
@@ -879,14 +878,12 @@ class Aplicacion(tk.Tk):
                             serial = header.get("serial", "DESCONOCIDO")
                             self.log_iot(f"🔎 Dispositivo detectado: {serial}")
                             try:
-                               
-
-                               from src.pstrace_connection import ejecutar_sesion_remota_iot
-                               method_params = {}  # personaliza según tu sensor
-                               ejecutar_sesion_remota_iot(serial, method_params)
-                               self.log_iot(f"🔧 Sesión remota ejecutada automáticamente para {serial}")
+                                from src.pstrace_connection import ejecutar_sesion_remota_iot
+                                method_params = {}  # personaliza según tu sensor
+                                ejecutar_sesion_remota_iot(serial, method_params)
+                                self.log_iot(f"🔧 Sesión remota ejecutada automáticamente para {serial}")
                             except Exception as e:
-                              self.log_iot(f"❌ Error ejecutando sesión remota para {serial}: {e}")
+                                self.log_iot(f"❌ Error ejecutando sesión remota para {serial}: {e}")
 
                             filename = header["filename"]
                             size = int(header["size"])
@@ -985,10 +982,6 @@ class Aplicacion(tk.Tk):
         except Exception as e:
             self.log_iot(f"❌ Error de envío: {e}")
             messagebox.showerror("Error", str(e))
-
-
-
-
 
     # ————— Bloque: Registrar mensajes en ventana de logs —————
     def log_message(self, msg):
