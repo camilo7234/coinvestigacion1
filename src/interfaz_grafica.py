@@ -845,6 +845,20 @@ class Aplicacion(tk.Tk):
             return
 
         def server_loop():
+            # Imports locales para evitar depender del scope global si pegas este bloque
+            import sys
+            import importlib
+            import threading
+            import hashlib
+            import socket
+            import json
+            import os
+
+            # Asegurar que la raíz del proyecto esté en sys.path para que `from src...` funcione
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+
             host = "0.0.0.0"
             port = self.iot_port_var.get()
             buffer_size = 4096
@@ -866,41 +880,117 @@ class Aplicacion(tk.Tk):
                         with conn:
                             header_data = b""
                             while not header_data.endswith(b"\n"):
-                                chunk = conn.recv(1)
+                                try:
+                                    chunk = conn.recv(1)
+                                except Exception as e:
+                                    self.log_iot(f"❌ Error leyendo socket: {e}")
+                                    break
                                 if not chunk:
                                     break
                                 header_data += chunk
+
                             if not header_data:
                                 self.log_iot("⚠️ Conexión vacía.")
                                 continue
 
-                            header = json.loads(header_data.decode().strip())
+                            header_text = header_data.decode(errors="replace").strip()
+
+                            # Manejar pings simples y otros mensajes no JSON sin romper
+                            if header_text.lower() == "ping" or header_text.lower() == "ping\n":
+                                self.log_iot(f"📡 Ping recibido desde {addr}")
+                                try:
+                                    conn.sendall(b"PONG\n")
+                                except Exception:
+                                    pass
+                                continue
+
+                            # Intentar parsear JSON; si falla, responder y continuar
+                            try:
+                                header = json.loads(header_text)
+                            except Exception as e:
+                                self.log_iot(f"❌ Encabezado inválido (no JSON): {header_text!r} - {e}")
+                                try:
+                                    conn.sendall(b"ERR_INVALID_HEADER\n")
+                                except Exception:
+                                    pass
+                                continue
+
+                            # Validar keys mínimas
+                            if not all(k in header for k in ("filename", "size", "checksum")):
+                                self.log_iot(f"❌ Encabezado incompleto: {header}")
+                                try:
+                                    conn.sendall(b"ERR_INCOMPLETE_HEADER\n")
+                                except Exception:
+                                    pass
+                                continue
+
                             serial = header.get("serial", "DESCONOCIDO")
                             self.log_iot(f"🔎 Dispositivo detectado: {serial}")
+
+                            # Ejecutar sesión remota en un hilo (import dinámico tolerante)
                             try:
-                                from src.pstrace_connection import ejecutar_sesion_remota_iot
+                                try:
+                                    from src.pstrace_connection import ejecutar_sesion_remota_iot
+                                except Exception:
+                                    mod = importlib.import_module("pstrace_connection")
+                                    ejecutar_sesion_remota_iot = getattr(mod, "ejecutar_sesion_remota_iot")
+
                                 method_params = {}  # personaliza según tu sensor
-                                ejecutar_sesion_remota_iot(serial, method_params)
-                                self.log_iot(f"🔧 Sesión remota ejecutada automáticamente para {serial}")
+                                threading.Thread(
+                                    target=ejecutar_sesion_remota_iot,
+                                    args=(serial, method_params, None),
+                                    daemon=True
+                                ).start()
+                                self.log_iot(f"🔧 Sesión remota lanzada para {serial}")
                             except Exception as e:
                                 self.log_iot(f"❌ Error ejecutando sesión remota para {serial}: {e}")
 
-                            filename = header["filename"]
-                            size = int(header["size"])
-                            checksum = header["checksum"]
+                            # Recibir archivo y verificar checksum
+                            try:
+                                filename = header["filename"]
+                                size = int(header["size"])
+                                checksum = header["checksum"]
 
-                            filepath = os.path.join(dest_dir, filename)
-                            conn.sendall(b"ACK")
-                            with open(filepath, "wb") as f:
-                                total_received = 0
-                                while total_received < size:
-                                    data = conn.recv(buffer_size)
-                                    if not data:
-                                        break
-                                    f.write(data)
-                                    total_received += len(data)
-                            self.log_iot(f"✅ Archivo recibido: {filename} ({total_received/1e6:.2f} MB)")
-                            conn.sendall(b"EOF_OK")
+                                filepath = os.path.join(dest_dir, filename)
+                                conn.sendall(b"ACK")
+                                with open(filepath, "wb") as f:
+                                    total_received = 0
+                                    while total_received < size:
+                                        chunk = conn.recv(buffer_size)
+                                        if not chunk:
+                                            break
+                                        f.write(chunk)
+                                        total_received += len(chunk)
+
+                                self.log_iot(f"✅ Archivo recibido: {filename} ({total_received/1e6:.2f} MB)")
+
+                                # Verificar checksum (no fallar el servidor si algo sale mal)
+                                try:
+                                    actual = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
+                                    if actual != checksum:
+                                        self.log_iot(f"⚠️ Checksum no coincide: esperado={checksum} actual={actual}")
+                                        try:
+                                            conn.sendall(b"ERR_CHECKSUM\n")
+                                        except Exception:
+                                            pass
+                                    else:
+                                        try:
+                                            conn.sendall(b"EOF_OK")
+                                        except Exception:
+                                            pass
+                                except Exception as ex:
+                                    self.log_iot(f"⚠️ No se pudo verificar checksum: {ex}")
+                                    try:
+                                        conn.sendall(b"EOF_OK")
+                                    except Exception:
+                                        pass
+
+                            except Exception as e:
+                                self.log_iot(f"❌ Error en transferencia de archivo: {e}")
+                                try:
+                                    conn.sendall(b"ERR_TRANSFER\n")
+                                except Exception:
+                                    pass
 
                     except socket.timeout:
                         continue
@@ -924,14 +1014,17 @@ class Aplicacion(tk.Tk):
         self.log_iot("🛑 Solicitando apagado del servidor...")
 
     def test_iot_connection(self):
-        """Prueba la conexión TCP simple con el servidor IoT."""
+        """Prueba la conexión TCP simple con el servidor IoT (envía ping JSON)."""
         host = self.iot_ip_var.get()
         port = self.iot_port_var.get()
         try:
             with socket.create_connection((host, port), timeout=3) as s:
-                s.sendall(b"ping")
-                self.log_iot(f"✅ Conectado con {host}:{port}")
-                messagebox.showinfo("Conexión exitosa", f"Conectado con {host}:{port}")
+                header = json.dumps({"action": "ping"}).encode() + b"\n"
+                s.sendall(header)
+                # esperar respuesta corta
+                resp = s.recv(128)
+                self.log_iot(f"✅ Conectado con {host}:{port} - respuesta: {resp!r}")
+                messagebox.showinfo("Conexión exitosa", f"Conectado con {host}:{port}\nRespuesta: {resp.decode(errors='ignore')}")
         except Exception as e:
             self.log_iot(f"❌ Error al conectar: {e}")
             messagebox.showerror("Error de conexión", str(e))
@@ -954,7 +1047,8 @@ class Aplicacion(tk.Tk):
             "action": "send_file",
             "filename": filename,
             "size": size,
-            "checksum": checksum
+            "checksum": checksum,
+            # opcional: "serial": "MI_SERIAL"
         }).encode() + b"\n"
 
         try:
@@ -962,7 +1056,7 @@ class Aplicacion(tk.Tk):
                 s.sendall(header)
                 ack = s.recv(8)
                 if ack != b"ACK":
-                    raise Exception("Servidor no aceptó la transferencia")
+                    raise Exception(f"Servidor no aceptó la transferencia (ack={ack!r})")
 
                 self.iot_progress["value"] = 0
                 self.iot_progress["maximum"] = size
@@ -977,7 +1071,10 @@ class Aplicacion(tk.Tk):
                         self.update_idletasks()
 
                 self.log_iot("✅ Transferencia completada.")
-                s.sendall(b"EOF")
+                try:
+                    s.sendall(b"EOF")
+                except Exception:
+                    pass
                 messagebox.showinfo("Éxito", f"Archivo {filename} enviado correctamente.")
         except Exception as e:
             self.log_iot(f"❌ Error de envío: {e}")
@@ -994,6 +1091,7 @@ class Aplicacion(tk.Tk):
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
         log.info(msg)
+
 
 
     # ————— Bloque: Exportación de figuras y tablas —————
