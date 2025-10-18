@@ -8,6 +8,10 @@ Si no hay dispositivo, reutiliza la carga desde un archivo .pssession.
 import os
 import sys
 import logging
+from device_events import DeviceEventManager, DeviceEvent
+# ===================================================================================
+# BLOQUE 1: CONFIGURACIÓN E INICIALIZACIÓN DEL ENTORNO  
+# ===================================================================================
 
 # 1) Añadir ruta raíz del proyecto para importar pstrace_session
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -65,79 +69,214 @@ except Exception as e:
 # ===================================================================================
 
 from typing import List, Dict
+import logging
+from dataclasses import dataclass
+from enum import Enum
+import asyncio
+
+class TransportType(Enum):
+    USB = "USB"
+    BLUETOOTH = "Bluetooth" 
+    TCP = "TCP"
+
+@dataclass
+class DeviceInfo:
+    name: str
+    serial: str = None 
+    transport: TransportType = None
+    address: str = None
+    status: str = "unknown"
 
 def descubrir_instrumentos() -> List[Dict]:
     """
     Descubre instrumentos disponibles (USB, Bluetooth, TCP).
-    Retorna lista de dicts uniformes:
-    {
-        'name': str,
-        'serial': str|None,
-        'transport': 'USB'|'Bluetooth'|'TCP',
-        'address': 'COMx'|'BT:AA:BB:...'|'host:port'
-    }
+    
+    Returns:
+        List[Dict]: Lista de dispositivos encontrados con formato:
+        {
+            'name': str,
+            'serial': str|None,
+            'transport': 'USB'|'Bluetooth'|'TCP',
+            'address': 'COMx'|'BT:AA:BB:...'|'host:port',
+            'status': str
+        }
+        
+    Raises:
+        RuntimeError: Si hay error crítico al cargar SDK
     """
     dispositivos = []
     try:
         import pspymethods
+        log = logging.getLogger(__name__)
 
-        # Ajusta a lo que realmente exponga tu SDK.
-        usb_list = []
-        bt_list = []
-        tcp_list = []
+        # Diccionario de métodos de descubrimiento
+        discovery_methods = {
+            TransportType.USB: getattr(pspymethods, "list_usb_devices", None),
+            TransportType.BLUETOOTH: getattr(pspymethods, "list_bluetooth_devices", None),
+            TransportType.TCP: getattr(pspymethods, "list_tcp_endpoints", None)
+        }
 
-        if hasattr(pspymethods, "list_usb_devices"):
-            usb_list = pspymethods.list_usb_devices()
-        if hasattr(pspymethods, "list_bluetooth_devices"):
-            bt_list = pspymethods.list_bluetooth_devices()
-        if hasattr(pspymethods, "list_tcp_endpoints"):
-            tcp_list = pspymethods.list_tcp_endpoints()
+        # Intentar cada método de descubrimiento
+        for transport_type, discovery_method in discovery_methods.items():
+            if discovery_method is None:
+                log.warning(f"Método de descubrimiento no disponible para {transport_type.value}")
+                continue
 
-        # Normalizar resultados
-        for dev in usb_list:
-            dispositivos.append({
-                'name': getattr(dev, 'Name', 'PalmSens'),
-                'serial': getattr(dev, 'SerialNumber', None),
-                'transport': 'USB',
-                'address': getattr(dev, 'PortName', None),  # ej: 'COM3'
-            })
-        for dev in bt_list:
-            dispositivos.append({
-                'name': getattr(dev, 'Name', 'PalmSens'),
-                'serial': getattr(dev, 'SerialNumber', None),
-                'transport': 'Bluetooth',
-                'address': getattr(dev, 'Address', None),  # ej: 'BT:AA:BB:CC:DD:EE'
-            })
-        for dev in tcp_list:
-            dispositivos.append({
-                'name': getattr(dev, 'Name', 'PalmSens'),
-                'serial': getattr(dev, 'SerialNumber', None),
-                'transport': 'TCP',
-                'address': getattr(dev, 'Endpoint', None),  # ej: '192.168.1.50:8080'
-            })
+            try:
+                device_list = discovery_method()
+                
+                # Procesar dispositivos encontrados
+                for dev in device_list:
+                    device_info = DeviceInfo(
+                        name=getattr(dev, 'Name', 'PalmSens'),
+                        serial=getattr(dev, 'SerialNumber', None),
+                        transport=transport_type,
+                        address=_get_device_address(dev, transport_type),
+                        status='available'
+                    )
+                    
+                    if _validar_dispositivo(device_info):
+                        dispositivos.append(device_info.__dict__)
+                    else:
+                        log.warning(f"Dispositivo inválido encontrado: {device_info}")
 
+            except Exception as e:
+                log.error(f"Error descubriendo dispositivos {transport_type.value}: {str(e)}")
+                continue
+
+        # Logging detallado del resultado
         log.info(f"✓ Descubiertos {len(dispositivos)} dispositivos")
+        for dev in dispositivos:
+            log.debug(f"Dispositivo encontrado: {dev}")
+            
         return dispositivos
 
+    except ImportError as e:
+        log.critical(f"✗ Error crítico: No se pudo cargar SDK PalmSens: {str(e)}")
+        raise RuntimeError("SDK PalmSens no disponible") from e
     except Exception as e:
         log.exception("✗ Error durante la descubierta de instrumentos")
         return []
+
+def _get_device_address(dev, transport_type: TransportType) -> str:
+    """Obtiene la dirección formateada según el tipo de transporte"""
+    if transport_type == TransportType.USB:
+        return getattr(dev, 'PortName', None)
+    elif transport_type == TransportType.BLUETOOTH:
+        return f"BT:{getattr(dev, 'Address', None)}"
+    elif transport_type == TransportType.TCP:
+        return getattr(dev, 'Endpoint', None)
+    return None
+
+def _validar_dispositivo(device_info: DeviceInfo) -> bool:
+    """Valida que el dispositivo tenga los campos mínimos necesarios"""
+    return all([
+        device_info.name,
+        device_info.transport,
+        device_info.address is not None
+    ])
+
+async def verificar_conectividad_dispositivo(device_info: Dict) -> bool:
+    """
+    Verifica que el dispositivo esté realmente disponible
+    
+    Args:
+        device_info (Dict): Información del dispositivo a verificar
+        
+    Returns:
+        bool: True si el dispositivo responde, False en caso contrario
+    """
+    try:
+        # Implementar verificación según tipo de transporte
+        if device_info['transport'] == TransportType.TCP.value:
+            host, port = device_info['address'].split(':')
+            reader, writer = await asyncio.open_connection(host, int(port))
+            writer.close()
+            await writer.wait_closed()
+            return True
+            
+        # Para USB y Bluetooth podemos asumir que si fueron detectados están disponibles
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error verificando dispositivo {device_info['name']}: {str(e)}")
+        return False
+    
+
 # ===================================================================================
 # BLOQUE 3: CONEXIÓN Y DESCONEXIÓN DE INSTRUMENTOS
 # ===================================================================================
+
+import asyncio
+from typing import Optional, Dict
+from contextlib import contextmanager
 
 class PalmSensConnectionError(Exception):
     """Error personalizado para fallos de conexión PalmSens"""
     pass
 
+class ConnectionManager:
+    """Gestor de conexiones para mantener estado y reconexión"""
+    _instance = None
+    _active_connections = {}
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = ConnectionManager()
+        return cls._instance
+    
+    def register_connection(self, device_id: str, connection):
+        self._active_connections[device_id] = {
+            'connection': connection,
+            'last_heartbeat': asyncio.get_event_loop().time(),
+            'reconnect_attempts': 0
+        }
+    
+    def remove_connection(self, device_id: str):
+        self._active_connections.pop(device_id, None)
+
+@contextmanager
+def connection_context(device_id: str, connection):
+    """Contexto para gestionar conexiones automáticamente"""
+    manager = ConnectionManager.get_instance()
+    try:
+        manager.register_connection(device_id, connection)
+        yield connection
+    finally:
+        manager.remove_connection(device_id)
+
+async def check_device_health(instrumento) -> bool:
+    """Verifica el estado de salud del dispositivo"""
+    try:
+        estado = await asyncio.to_thread(estado_instrumento, instrumento)
+        return estado['connected'] and not estado['last_error']
+    except Exception:
+        return False
 
 def conectar_instrumento(serial: str = None,
                          transport: str = None,
                          address: str = None,
-                         timeout_ms: int = 10000):
+                         timeout_ms: int = 10000,
+                         max_retries: int = 3,
+                         retry_delay: float = 1.0):
     """
     Conecta con un instrumento PalmSens usando serial o address.
     Retorna el objeto 'instrumento' del SDK.
+    
+    Args:
+        serial (str, optional): Número de serie del dispositivo
+        transport (str, optional): Tipo de transporte (USB/Bluetooth/TCP)
+        address (str, optional): Dirección del dispositivo
+        timeout_ms (int): Timeout en milisegundos
+        max_retries (int): Número máximo de intentos de conexión
+        retry_delay (float): Tiempo entre reintentos en segundos
+    
+    Returns:
+        Object: Objeto instrumento del SDK
+        
+    Raises:
+        PalmSensConnectionError: Si la conexión falla después de todos los reintentos
     """
     dispositivos = descubrir_instrumentos()
     if not dispositivos:
@@ -165,31 +304,55 @@ def conectar_instrumento(serial: str = None,
              f"serial={objetivo.get('serial')} "
              f"via {objetivo['transport']} @ {objetivo.get('address')}")
 
-    try:
-        import pspymethods
-        instrumento = None
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            import pspymethods
+            instrumento = None
 
-        # Ajusta a los métodos reales de tu SDK
-        if objetivo['transport'] == 'USB' and hasattr(pspymethods, "connect_usb"):
-            instrumento = pspymethods.connect_usb(objetivo['address'], timeout_ms)
-        elif objetivo['transport'] == 'Bluetooth' and hasattr(pspymethods, "connect_bluetooth"):
-            instrumento = pspymethods.connect_bluetooth(objetivo['address'], timeout_ms)
-        elif objetivo['transport'] == 'TCP' and hasattr(pspymethods, "connect_tcp"):
-            host, port = objetivo['address'].split(':')
-            instrumento = pspymethods.connect_tcp(host, int(port), timeout_ms)
-        else:
-            raise PalmSensConnectionError(f"Transporte no soportado o método no disponible: {objetivo['transport']}")
+            # Timeouts específicos por tipo de transporte
+            transport_timeouts = {
+                'USB': timeout_ms,
+                'Bluetooth': timeout_ms * 2,  # Bluetooth necesita más tiempo
+                'TCP': timeout_ms
+            }
+            
+            current_timeout = transport_timeouts.get(objetivo['transport'], timeout_ms)
 
-        if instrumento is None:
-            raise PalmSensConnectionError("El SDK no retornó objeto instrumento (conexión fallida).")
+            # Ajusta a los métodos reales de tu SDK
+            if objetivo['transport'] == 'USB' and hasattr(pspymethods, "connect_usb"):
+                instrumento = pspymethods.connect_usb(objetivo['address'], current_timeout)
+            elif objetivo['transport'] == 'Bluetooth' and hasattr(pspymethods, "connect_bluetooth"):
+                instrumento = pspymethods.connect_bluetooth(objetivo['address'], current_timeout)
+            elif objetivo['transport'] == 'TCP' and hasattr(pspymethods, "connect_tcp"):
+                host, port = objetivo['address'].split(':')
+                instrumento = pspymethods.connect_tcp(host, int(port), current_timeout)
+            else:
+                raise PalmSensConnectionError(f"Transporte no soportado o método no disponible: {objetivo['transport']}")
 
-        log.info("✓ Conexión establecida correctamente.")
-        return instrumento
+            if instrumento is None:
+                raise PalmSensConnectionError("El SDK no retornó objeto instrumento (conexión fallida).")
 
-    except Exception as e:
-        log.exception("✗ Error durante la conexión al instrumento")
-        raise PalmSensConnectionError(str(e))
+            # Verificar estado del dispositivo
+            if asyncio.run(check_device_health(instrumento)):
+                log.info(f"✓ Conexión establecida correctamente (intento {attempt + 1}/{max_retries})")
+                
+                # Registrar conexión en el gestor
+                device_id = objetivo.get('serial') or objetivo.get('address')
+                with connection_context(device_id, instrumento):
+                    return instrumento
+            else:
+                raise PalmSensConnectionError("Dispositivo no responde correctamente")
 
+        except Exception as e:
+            last_exception = e
+            log.warning(f"Intento {attempt + 1}/{max_retries} fallido: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            continue
+
+    log.exception("✗ Error durante la conexión al instrumento")
+    raise PalmSensConnectionError(f"Conexión fallida después de {max_retries} intentos: {str(last_exception)}")
 
 def estado_instrumento(instrumento) -> dict:
     """
@@ -213,7 +376,6 @@ def estado_instrumento(instrumento) -> dict:
     log.debug(f"Estado instrumento: {est}")
     return est
 
-
 def desconectar_instrumento(instrumento):
     """
     Cierra la conexión usando el método del SDK correspondiente.
@@ -225,9 +387,16 @@ def desconectar_instrumento(instrumento):
             import pspymethods
             if hasattr(pspymethods, "disconnect"):
                 pspymethods.disconnect(instrumento)
+        
+        # Limpiar del gestor de conexiones
+        device_id = getattr(instrumento, 'SerialNumber', None)
+        if device_id:
+            ConnectionManager.get_instance().remove_connection(device_id)
+            
         log.info("✓ Instrumento desconectado correctamente.")
     except Exception:
-        log.exception("✗ Error al desconectar instrumento")    
+        log.exception("✗ Error al desconectar instrumento")
+
 
 
 # ===================================================================================
@@ -235,68 +404,181 @@ def desconectar_instrumento(instrumento):
 # ===================================================================================
 
 import datetime
+from typing import Dict, List, Optional
+import asyncio
+from collections import deque
 
-def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
+async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
     """
-    Ejecuta una medición de voltametría cíclica remota en el instrumento y
-    retorna un dict compatible con el pipeline de pstrace_session.py:
-    {
-        'session_info': {...},
-        'measurements': [ { 'title', 'timestamp', 'device_serial', 'curve_count', 'curves': [ [ {'potential','current'}, ... ], ... ] } ],
-    }
+    Ejecuta una medición CV con eventos y streaming en tiempo real.
+    
+    Args:
+        instrumento: Objeto instrumento PalmSens
+        method_params: Parámetros de configuración CV
+        
+    Returns:
+        dict: Datos normalizados y metadata de la sesión
     """
+    # Buffer circular para datos en tiempo real
+    buffer_datos = deque(maxlen=10000)
+    device_id = getattr(instrumento, 'SerialNumber', "Unknown")
+
     try:
         import pspymethods
 
-        # 1) Configurar método CV en el instrumento (ajusta a tu SDK real)
+        # 1) Validar y normalizar parámetros
+        method_params = _validar_parametros_cv(method_params)
+        
+        # 2) Configurar método CV con eventos
         if hasattr(pspymethods, "configure_cv"):
+            await event_manager.emit_event(DeviceEvent(
+                type="cv_config_start",
+                timestamp=datetime.datetime.now(),
+                data=method_params,
+                device_id=device_id
+            ))
+            
             pspymethods.configure_cv(instrumento, **method_params)
             log.info("✓ Método CV configurado con parámetros: %s", method_params)
+            
+            await event_manager.emit_event(DeviceEvent(
+                type="cv_config_complete",
+                timestamp=datetime.datetime.now(),
+                data={"status": "configured"},
+                device_id=device_id
+            ))
         else:
-            log.warning("⚠ configure_cv no disponible en pspymethods, usando configuración por defecto")
+            raise PalmSensConnectionError("configure_cv no disponible en SDK")
 
-        # 2) Ejecutar medición y obtener datos
-        if not hasattr(pspymethods, "run_cv_and_get_data"):
-            raise PalmSensConnectionError("SDK no expone run_cv_and_get_data")
-        data = pspymethods.run_cv_and_get_data(instrumento)
+        # 3) Configurar callback para streaming
+        async def data_callback(punto_medicion):
+            """Callback para procesar datos en tiempo real"""
+            try:
+                datos = {
+                    "potential": float(punto_medicion.Potential),
+                    "current": float(punto_medicion.Current),
+                    "timestamp": datetime.datetime.now()
+                }
+                
+                # Almacenar en buffer
+                buffer_datos.append(datos)
+                
+                # Emitir evento de datos
+                await event_manager.emit_event(DeviceEvent(
+                    type="cv_data_point",
+                    timestamp=datos["timestamp"],
+                    data=datos,
+                    device_id=device_id
+                ))
+                
+                # Registrar actividad del dispositivo
+                await event_manager.register_heartbeat(device_id)
+                
+            except Exception as e:
+                await event_manager.emit_event(DeviceEvent(
+                    type="cv_data_error",
+                    timestamp=datetime.datetime.now(),
+                    data={"error": str(e)},
+                    device_id=device_id
+                ))
 
-        # 3) Normalizar curvas
-        curvas_normalizadas = []
-        for ciclo in data.get("cycles", []):
-            if hasattr(ciclo, "GetXValues") and hasattr(ciclo, "GetYValues"):
-                xs = [float(x) for x in ciclo.GetXValues()]
-                ys = [float(y) for y in ciclo.GetYValues()]
-                curvas_normalizadas.append([{"potential": x, "current": y} for x, y in zip(xs, ys)])
-            elif isinstance(ciclo, dict) and "X" in ciclo and "Y" in ciclo:
-                xs = [float(x) for x in ciclo["X"]]
-                ys = [float(y) for y in ciclo["Y"]]
-                curvas_normalizadas.append([{"potential": x, "current": y} for x, y in zip(xs, ys)])
+        # 4) Ejecutar medición con streaming
+        if not hasattr(pspymethods, "run_cv_streaming"):
+            raise PalmSensConnectionError("SDK no soporta streaming")
+            
+        await event_manager.emit_event(DeviceEvent(
+            type="cv_measurement_start",
+            timestamp=datetime.datetime.now(),
+            data={"mode": "streaming"},
+            device_id=device_id
+        ))
+        
+        data = await pspymethods.run_cv_streaming(
+            instrumento,
+            callback=data_callback,
+            buffer_size=method_params.get("buffer_size", 1000)
+        )
 
-        # 4) Construir session_info y measurement
+        # 5) Normalizar y procesar curvas
+        curvas_normalizadas = _normalizar_curvas(list(buffer_datos))
+
+        # 6) Construir respuesta
         session_info = {
             "scan_rate": method_params.get("scan_rate"),
             "start_potential": method_params.get("start_potential"),
             "end_potential": method_params.get("end_potential"),
             "software_version": "PSTrace 5.9.3803",
+            "streaming_enabled": True,
+            "buffer_size": len(buffer_datos)
         }
 
         measurement = {
-            "title": "CV remoto",
+            "title": "CV Streaming",
             "timestamp": datetime.datetime.now(),
-            "device_serial": getattr(instrumento, 'SerialNumber', "Unknown"),
+            "device_serial": device_id,
             "curve_count": len(curvas_normalizadas),
             "curves": curvas_normalizadas,
         }
 
-        log.info(f"✓ Medición remota completada: {measurement['curve_count']} curvas")
+        # 7) Emitir evento de finalización
+        await event_manager.emit_event(DeviceEvent(
+            type="cv_measurement_complete",
+            timestamp=datetime.datetime.now(),
+            data=measurement,
+            device_id=device_id
+        ))
+
+        log.info(f"✓ Medición streaming completada: {measurement['curve_count']} curvas")
         return {
             "session_info": session_info,
             "measurements": [measurement],
         }
 
-    except Exception:
-        log.exception("✗ Error durante medición CV remota")
-        raise
+    except Exception as e:
+        log.exception("✗ Error durante medición CV streaming")
+        await event_manager.emit_event(DeviceEvent(
+            type="cv_error",
+            timestamp=datetime.datetime.now(),
+            data={"error": str(e)},
+            device_id=device_id
+        ))
+        raise PalmSensConnectionError(f"Error en medición CV: {str(e)}")
+
+def _validar_parametros_cv(params: Dict) -> Dict:
+    """Valida y normaliza parámetros CV"""
+    required = ["scan_rate", "start_potential", "end_potential"]
+    for param in required:
+        if param not in params:
+            raise ValueError(f"Falta parámetro requerido: {param}")
+            
+    if not (0.001 <= params["scan_rate"] <= 1000):
+        raise ValueError("scan_rate debe estar entre 0.001 y 1000 V/s")
+        
+    return params
+
+def _normalizar_curvas(buffer_datos: List[Dict]) -> List[List[Dict]]:
+    """Convierte buffer de datos en curvas normalizadas"""
+    curvas = []
+    curva_actual = []
+    
+    for punto in buffer_datos:
+        curva_actual.append({
+            "potential": punto["potential"],
+            "current": punto["current"]
+        })
+        
+        # Detectar fin de ciclo (cambio en dirección del potencial)
+        if len(curva_actual) > 1:
+            if (curva_actual[-1]["potential"] < curva_actual[-2]["potential"] and
+                len(curva_actual) > 100):  # mínimo de puntos
+                curvas.append(curva_actual)
+                curva_actual = []
+                
+    if curva_actual:  # agregar última curva
+        curvas.append(curva_actual)
+        
+    return curvas
+
 
 # ===================================================================================
 # BLOQUE 5: ORQUESTACIÓN CON BD Y GUI
