@@ -17,6 +17,7 @@ import importlib
 import hashlib
 import time
 from datetime import datetime
+from typing import Optional
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -45,7 +46,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 
-def _now_ts():
+def _now_ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
@@ -58,7 +59,7 @@ def save_iot_devices():
         print(f"⚠️ No se pudo guardar {IOT_DEVICES_FILE}: {e}")
 
 
-def save_sensor_data(serial, payload):
+def save_sensor_data(serial: str, payload):
     """Guardar la última lectura por serial en datos_sensores.json (para monitor)."""
     try:
         data = {}
@@ -78,7 +79,7 @@ def save_sensor_data(serial, payload):
         print(f"⚠️ No se pudieron guardar datos IoT: {e}")
 
 
-def try_launch_remote_session(serial, method_params=None, gui_refresh_callback=None):
+def try_launch_remote_session(serial: str, method_params: Optional[dict] = None, gui_refresh_callback=None):
     """
     Intenta lanzar ejecutar_sesion_remota_iot(serial, method_params, gui_refresh_callback)
     en un hilo sin bloquear el servidor. Si no existe el módulo, lo registra.
@@ -89,6 +90,7 @@ def try_launch_remote_session(serial, method_params=None, gui_refresh_callback=N
         try:
             from src.pstrace_connection import ejecutar_sesion_remota_iot
         except Exception:
+            # Fallback a import por nombre si no está dentro del paquete src
             mod = importlib.import_module("pstrace_connection")
             ejecutar_sesion_remota_iot = getattr(mod, "ejecutar_sesion_remota_iot")
         thread = threading.Thread(
@@ -102,28 +104,40 @@ def try_launch_remote_session(serial, method_params=None, gui_refresh_callback=N
         print(f"⚠ Error lanzando sesión remota: {e}")
 
 
-def handle_client(conn, addr):
-    """Maneja una conexión entrante (header JSON terminado en \\n, luego posible payload binario)."""
+def _recv_header(conn: socket.socket, max_header_bytes: int = 64 * 1024) -> Optional[str]:
+    """
+    Lee byte-a-byte hasta encontrar newline. Devuelve texto (sin newline) o None.
+    Maneja CRLF y protege contra headers demasiado grandes.
+    """
     try:
         header_data = b""
-        # Leer header byte a byte hasta newline. Tiene tolerancia (máx 64KB)
         while not header_data.endswith(b"\n"):
             chunk = conn.recv(1)
             if not chunk:
                 break
             header_data += chunk
-            if len(header_data) > 64 * 1024:
+            if len(header_data) > max_header_bytes:
                 break
-
         if not header_data:
-            print("⚠ Conexión vacía.")
+            return None
+        # Decodificar y normalizar CRLF/CR
+        text = header_data.decode(errors="replace").rstrip("\r\n")
+        return text.strip()
+    except Exception:
+        return None
+
+
+def handle_client(conn: socket.socket, addr):
+    """Maneja una conexión entrante (header JSON terminado en \\n, luego posible payload binario)."""
+    try:
+        header_text = _recv_header(conn)
+        if header_text is None:
+            print("⚠ Conexión vacía o header no recibido.")
             try:
                 conn.close()
             except Exception:
                 pass
             return
-
-        header_text = header_data.decode(errors="replace").strip()
 
         # Soportar ping en texto simple (cliente antiguo)
         if header_text.lower() == "ping":
@@ -153,133 +167,198 @@ def handle_client(conn, addr):
                 pass
             return
 
-        # ------------- Acción: ping (JSON) -------------
-        if isinstance(header, dict) and header.get("action") == "ping":
-            print(f"📡 Ping JSON recibido desde {addr}")
-            try:
-                conn.sendall(b"PONG\n")
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-
-        # ------------- Acción: hello (registro de dispositivo) -------------
-        if isinstance(header, dict) and header.get("action") == "hello":
-            serial = header.get("serial", "DESCONOCIDO")
-            device_type = header.get("device_type", "UNKNOWN")
-            ipaddr = addr[0]
-            iot_devices[serial] = {
-                "ip": ipaddr,
-                "device_type": device_type,
-                "last_seen": time.time()
-            }
-            save_iot_devices()
-            print(f"🔔 Hello recibido: serial={serial} type={device_type} desde {ipaddr}")
-            try:
-                conn.sendall(b"ACK_HELLO\n")
-            except Exception:
-                pass
-            # lanzar sesión remota no bloqueante
-            try_launch_remote_session(serial, method_params={}, gui_refresh_callback=None)
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-
-        # ------------- Acción: data (telemetría en vivo) -------------
-        if isinstance(header, dict) and header.get("action") == "data":
-            serial = header.get("serial", "DESCONOCIDO")
-            payload = header.get("payload", {})
-            print(f"📊 Datos en vivo desde {serial}: {payload}")
-            # Guardar último valor para monitor GUI
-            save_sensor_data(serial, payload)
-            try:
-                conn.sendall(b"ACK_DATA\n")
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-
-        # ------------- Acción: send_file (transferencia de archivo) -------------
-        if not (isinstance(header, dict) and header.get("action") == "send_file"):
-            print(f"❌ Acción desconocida o header no es send_file: {header}")
-            try:
-                conn.sendall(b"ERR_UNKNOWN_ACTION\n")
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-
-        # Validar keys
-        if not all(k in header for k in ("filename", "size", "checksum")):
-            print(f"❌ Encabezado incompleto para send_file: {header}")
-            try:
-                conn.sendall(b"ERR_INCOMPLETE_HEADER\n")
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-
-        filename = header["filename"]
-        size = int(header["size"])
-        checksum = header["checksum"]
-        serial = header.get("serial", "DESCONOCIDO")
-        print(f"🔎 Dispositivo detectado: {serial} - Recibiendo {filename} ({size/1e6:.2f} MB)")
-
-        # Lanzar sesión remota en hilo (no bloquear)
-        try_launch_remote_session(serial, method_params={}, gui_refresh_callback=None)
-
-        filepath = os.path.join(DEST_DIR, filename)
-        # Confirmar que servidor está listo para recibir
-        try:
-            conn.sendall(b"ACK")
-        except Exception:
-            pass
-
-        with open(filepath, "wb") as f:
-            total_received = 0
-            while total_received < size:
-                data = conn.recv(BUFFER_SIZE)
-                if not data:
-                    break
-                f.write(data)
-                total_received += len(data)
-
-        print(f"✅ Archivo recibido: {filepath} ({total_received/1e6:.2f} MB)")
-
-        # Validar checksum (no romper en caso de error, solo informar)
-        try:
-            actual = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
-            if actual != checksum:
-                print(f"⚠️ Checksum no coincide: esperado={checksum} actual={actual}")
+        # A partir de aquí, header es un objeto JSON (normalmente dict)
+        # Detectar y manejar actions primero (ping, hello, data)
+        if isinstance(header, dict):
+            # ------------- Acción: ping (JSON) -------------
+            if header.get("action") == "ping":
+                print(f"📡 Ping JSON recibido desde {addr}")
                 try:
-                    conn.sendall(b"ERR_CHECKSUM\n")
+                    conn.sendall(b"PONG\n")
                 except Exception:
                     pass
-            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            # ------------- Acción: hello (registro de dispositivo) -------------
+            if header.get("action") == "hello":
+                serial = header.get("serial", "DESCONOCIDO")
+                device_type = header.get("device_type", "UNKNOWN")
+                ipaddr = addr[0]
+                iot_devices[serial] = {
+                    "ip": ipaddr,
+                    "device_type": device_type,
+                    "last_seen": time.time()
+                }
+                save_iot_devices()
+                print(f"🔔 Hello recibido: serial={serial} type={device_type} desde {ipaddr}")
+                try:
+                    conn.sendall(b"ACK_HELLO\n")
+                except Exception:
+                    pass
+                # lanzar sesión remota no bloqueante
+                try_launch_remote_session(serial, method_params={}, gui_refresh_callback=None)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            # ------------- Acción: data (telemetría en vivo) -------------
+            if header.get("action") == "data":
+                serial = header.get("serial", "DESCONOCIDO")
+                payload = header.get("payload", {})
+                print(f"📊 Datos en vivo desde {serial}: {payload}")
+                # Guardar último valor para monitor GUI
+                save_sensor_data(serial, payload)
+                try:
+                    conn.sendall(b"ACK_DATA\n")
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            # ------------- Acción: send_file (transferencia de archivo) -------------
+            if header.get("action") == "send_file":
+                # validar keys necesarias
+                if not all(k in header for k in ("filename", "size", "checksum")):
+                    print(f"❌ Encabezado incompleto para send_file: {header}")
+                    try:
+                        conn.sendall(b"ERR_INCOMPLETE_HEADER\n")
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+
+                filename = header["filename"]
+                size = int(header["size"])
+                checksum = header["checksum"]
+                serial = header.get("serial", "DESCONOCIDO")
+                print(f"🔎 Dispositivo detectado: {serial} - Recibiendo {filename} ({size/1e6:.2f} MB)")
+
+                # Lanzar sesión remota en hilo (no bloquear)
+                try_launch_remote_session(serial, method_params={}, gui_refresh_callback=None)
+
+                filepath = os.path.join(DEST_DIR, filename)
+                # Confirmar que servidor está listo para recibir
+                try:
+                    conn.sendall(b"ACK")
+                except Exception:
+                    pass
+
+                with open(filepath, "wb") as f:
+                    total_received = 0
+                    while total_received < size:
+                        data = conn.recv(BUFFER_SIZE)
+                        if not data:
+                            break
+                        f.write(data)
+                        total_received += len(data)
+
+                print(f"✅ Archivo recibido: {filepath} ({total_received/1e6:.2f} MB)")
+
+                # Validar checksum (no romper en caso de error, solo informar)
+                try:
+                    actual = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
+                    if actual != checksum:
+                        print(f"⚠️ Checksum no coincide: esperado={checksum} actual={actual}")
+                        try:
+                            conn.sendall(b"ERR_CHECKSUM\n")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            conn.sendall(b"EOF_OK")
+                        except Exception:
+                            pass
+                except Exception as ex:
+                    print(f"⚠️ No se pudo verificar checksum: {ex}")
+                    try:
+                        conn.sendall(b"EOF_OK")
+                    except Exception:
+                        pass
+
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+        # Si llegamos aquí: el header JSON no contenía un action conocido.
+        # Pero puede tratarse de un header "implicito" de envío de archivo (sin action),
+        # por compatibilidad con clientes que no envían action.
+        if isinstance(header, dict) and all(k in header for k in ("filename", "size", "checksum")):
+            # Tratar como send_file retrocompatible
+            filename = header["filename"]
+            size = int(header["size"])
+            checksum = header["checksum"]
+            serial = header.get("serial", "DESCONOCIDO")
+            print(f"🔎 (retro) Dispositivo detectado: {serial} - Recibiendo {filename} ({size/1e6:.2f} MB)")
+
+            try_launch_remote_session(serial, method_params={}, gui_refresh_callback=None)
+
+            filepath = os.path.join(DEST_DIR, filename)
+            try:
+                conn.sendall(b"ACK")
+            except Exception:
+                pass
+
+            with open(filepath, "wb") as f:
+                total_received = 0
+                while total_received < size:
+                    data = conn.recv(BUFFER_SIZE)
+                    if not data:
+                        break
+                    f.write(data)
+                    total_received += len(data)
+
+            print(f"✅ Archivo recibido: {filepath} ({total_received/1e6:.2f} MB)")
+
+            try:
+                actual = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
+                if actual != checksum:
+                    print(f"⚠️ Checksum no coincide: esperado={checksum} actual={actual}")
+                    try:
+                        conn.sendall(b"ERR_CHECKSUM\n")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        conn.sendall(b"EOF_OK")
+                    except Exception:
+                        pass
+            except Exception as ex:
+                print(f"⚠️ No se pudo verificar checksum: {ex}")
                 try:
                     conn.sendall(b"EOF_OK")
                 except Exception:
                     pass
-        except Exception as ex:
-            print(f"⚠️ No se pudo verificar checksum: {ex}")
+
             try:
-                conn.sendall(b"EOF_OK")
+                conn.close()
             except Exception:
                 pass
+            return
+
+        # Si no se reconoció la petición:
+        print(f"❌ Acción desconocida o header mal formado: {header}")
+        try:
+            conn.sendall(b"ERR_UNKNOWN_ACTION\n")
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     except Exception as e:
         print(f"❌ Error manejando cliente {addr}: {e}")
