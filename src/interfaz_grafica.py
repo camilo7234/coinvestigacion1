@@ -895,9 +895,9 @@ class Aplicacion(tk.Tk):
 
                             header_text = header_data.decode(errors="replace").strip()
 
-                            # Manejar pings simples y otros mensajes no JSON sin romper
+                            # Manejar pings enviados como texto simple
                             if header_text.lower() == "ping" or header_text.lower() == "ping\n":
-                                self.log_iot(f"📡 Ping recibido desde {addr}")
+                                self.log_iot(f"📡 Ping recibido (texto) desde {addr}")
                                 try:
                                     conn.sendall(b"PONG\n")
                                 except Exception:
@@ -915,7 +915,17 @@ class Aplicacion(tk.Tk):
                                     pass
                                 continue
 
-                            # Validar keys mínimas
+                            # --- Soportar ping enviado como JSON {"action":"ping"} ---
+                            if isinstance(header, dict) and header.get("action") == "ping":
+                                self.log_iot(f"📡 Ping JSON recibido desde {addr}")
+                                try:
+                                    conn.sendall(b"PONG\n")
+                                except Exception:
+                                    pass
+                                continue
+                            # ----------------------------------------------------------------
+
+                            # Validar keys mínimas para transferencia de archivos
                             if not all(k in header for k in ("filename", "size", "checksum")):
                                 self.log_iot(f"❌ Encabezado incompleto: {header}")
                                 try:
@@ -952,7 +962,12 @@ class Aplicacion(tk.Tk):
                                 checksum = header["checksum"]
 
                                 filepath = os.path.join(dest_dir, filename)
-                                conn.sendall(b"ACK")
+                                # Confirmar que el servidor está listo para recibir
+                                try:
+                                    conn.sendall(b"ACK")
+                                except Exception:
+                                    pass
+
                                 with open(filepath, "wb") as f:
                                     total_received = 0
                                     while total_received < size:
