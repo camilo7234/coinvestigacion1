@@ -5,7 +5,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Dict, Set
-from device_events import DeviceEventManager, DeviceEvent
+from src.device_events import event_manager, DeviceEvent
 
 # Configuración
 HOST = "0.0.0.0"  # Escucha en todas las interfaces
@@ -20,8 +20,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Gestor de eventos
-event_manager = DeviceEventManager()
+# Gestor de eventos (singleton importado desde src.device_events)
 
 # Estado global
 clientes_activos: Dict[str, asyncio.StreamWriter] = {}

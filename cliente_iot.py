@@ -4,10 +4,9 @@ import os
 import argparse
 import asyncio
 from tqdm import tqdm
-from device_events import DeviceEventManager, DeviceEvent
+from device_events import event_manager, DeviceEvent
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config_cliente.json")
-event_manager = DeviceEventManager()
 
 # ...existing code for cargar_config(), guardar_config() and configurar()...
 

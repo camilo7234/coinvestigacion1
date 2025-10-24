@@ -8,7 +8,7 @@ Si no hay dispositivo, reutiliza la carga desde un archivo .pssession.
 import os
 import sys
 import logging
-from device_events import DeviceEventManager, DeviceEvent
+from device_events import event_manager, DeviceEvent
 # ===================================================================================
 # BLOQUE 1: CONFIGURACIÓN E INICIALIZACIÓN DEL ENTORNO  
 # ===================================================================================
@@ -25,7 +25,9 @@ try:
         configurar_entorno_python_net,
         configurar_sdk_palmsens,
         extract_session_dict,
-        cargar_limites_ppm
+        cargar_limites_ppm,
+        extraer_y_procesar_sesion_completa,
+        calcular_estimaciones_ppm
     )
     # Alias internos para consistencia en este módulo
     cargar_sesion = cargar_sesion_pssession
@@ -339,6 +341,12 @@ def conectar_instrumento(serial: str = None,
                 
                 # Registrar conexión en el gestor
                 device_id = objetivo.get('serial') or objetivo.get('address')
+                # Emitir evento de conexión
+                try:
+                    event_manager.emit_nowait('device_connected', {'serial': device_id, 'transport': objetivo.get('transport')}, device_id)
+                except Exception:
+                    log.debug("No se pudo emitir evento device_connected")
+
                 with connection_context(device_id, instrumento):
                     return instrumento
             else:
@@ -392,6 +400,10 @@ def desconectar_instrumento(instrumento):
         device_id = getattr(instrumento, 'SerialNumber', None)
         if device_id:
             ConnectionManager.get_instance().remove_connection(device_id)
+            try:
+                event_manager.emit_nowait('device_disconnected', {'serial': device_id}, device_id)
+            except Exception:
+                log.debug("No se pudo emitir device_disconnected")
             
         log.info("✓ Instrumento desconectado correctamente.")
     except Exception:
@@ -431,22 +443,13 @@ async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
         
         # 2) Configurar método CV con eventos
         if hasattr(pspymethods, "configure_cv"):
-            await event_manager.emit_event(DeviceEvent(
-                type="cv_config_start",
-                timestamp=datetime.datetime.now(),
-                data=method_params,
-                device_id=device_id
-            ))
+            # Emitir evento de inicio de configuración (no bloquear)
+            event_manager.emit_nowait('cv_config_start', method_params, device_id)
             
             pspymethods.configure_cv(instrumento, **method_params)
             log.info("✓ Método CV configurado con parámetros: %s", method_params)
             
-            await event_manager.emit_event(DeviceEvent(
-                type="cv_config_complete",
-                timestamp=datetime.datetime.now(),
-                data={"status": "configured"},
-                device_id=device_id
-            ))
+            event_manager.emit_nowait('cv_config_complete', {"status": "configured"}, device_id)
         else:
             raise PalmSensConnectionError("configure_cv no disponible en SDK")
 
@@ -464,34 +467,20 @@ async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
                 buffer_datos.append(datos)
                 
                 # Emitir evento de datos
-                await event_manager.emit_event(DeviceEvent(
-                    type="cv_data_point",
-                    timestamp=datos["timestamp"],
-                    data=datos,
-                    device_id=device_id
-                ))
+                # Emitir sin bloquear el SDK
+                event_manager.emit_nowait('cv_data_point', datos, device_id)
                 
                 # Registrar actividad del dispositivo
                 await event_manager.register_heartbeat(device_id)
                 
             except Exception as e:
-                await event_manager.emit_event(DeviceEvent(
-                    type="cv_data_error",
-                    timestamp=datetime.datetime.now(),
-                    data={"error": str(e)},
-                    device_id=device_id
-                ))
+                event_manager.emit_nowait('cv_data_error', {"error": str(e)}, device_id)
 
         # 4) Ejecutar medición con streaming
         if not hasattr(pspymethods, "run_cv_streaming"):
             raise PalmSensConnectionError("SDK no soporta streaming")
             
-        await event_manager.emit_event(DeviceEvent(
-            type="cv_measurement_start",
-            timestamp=datetime.datetime.now(),
-            data={"mode": "streaming"},
-            device_id=device_id
-        ))
+        event_manager.emit_nowait('cv_measurement_start', {"mode": "streaming"}, device_id)
         
         data = await pspymethods.run_cv_streaming(
             instrumento,
@@ -499,7 +488,7 @@ async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
             buffer_size=method_params.get("buffer_size", 1000)
         )
 
-        # 5) Normalizar y procesar curvas
+    # 5) Normalizar y procesar curvas
         curvas_normalizadas = _normalizar_curvas(list(buffer_datos))
 
         # 6) Construir respuesta
@@ -521,12 +510,7 @@ async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
         }
 
         # 7) Emitir evento de finalización
-        await event_manager.emit_event(DeviceEvent(
-            type="cv_measurement_complete",
-            timestamp=datetime.datetime.now(),
-            data=measurement,
-            device_id=device_id
-        ))
+        event_manager.emit_nowait('cv_measurement_complete', measurement, device_id)
 
         log.info(f"✓ Medición streaming completada: {measurement['curve_count']} curvas")
         return {
@@ -536,13 +520,146 @@ async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
 
     except Exception as e:
         log.exception("✗ Error durante medición CV streaming")
-        await event_manager.emit_event(DeviceEvent(
-            type="cv_error",
-            timestamp=datetime.datetime.now(),
-            data={"error": str(e)},
-            device_id=device_id
-        ))
+        event_manager.emit_nowait('cv_error', {"error": str(e)}, device_id)
         raise PalmSensConnectionError(f"Error en medición CV: {str(e)}")
+
+
+def simulate_stream_from_pssession(metodo_load, ruta_archivo, rate_hz: float = 10.0, device_id: str = "SIM_PSTRACE", max_points: int = None):
+    """
+    Simula un streaming a partir de un archivo .pssession emitiendo eventos 'cv_data_point'.
+
+    Args:
+        metodo_load: método LoadSessionFile configurado (de pstrace_session)
+        ruta_archivo: ruta al archivo .pssession
+        rate_hz: frecuencia de emisión en Hz
+        device_id: identificador del dispositivo simulado
+    """
+    try:
+        # Si no se pasó metodo_load intentar construirlo automáticamente
+        if metodo_load is None:
+            try:
+                dll = configurar_sdk_palmsens()
+                # _ps fue importado arriba como alias de src.pstrace_session
+                metodo_load = getattr(__import__('src.pstrace_session', fromlist=['cargar_y_configurar_metodo_load']), 'cargar_y_configurar_metodo_load')(dll)
+            except Exception as e:
+                log.warning("No se pudo construir metodo_load automático: %s", e)
+
+        # Procesar la sesión usando las funciones maestras de pstrace_session
+        try:
+            limites = cargar_limites_ppm()
+            resultado = extraer_y_procesar_sesion_completa(ruta_archivo, limites)
+        except Exception as e:
+            log.exception("Fallo procesando sesión para simulación: %s", e)
+            resultado = None
+
+        if not resultado:
+            log.error("No se pudo procesar la sesión para simulación: %s", ruta_archivo)
+            return
+
+        measurements = resultado.get('measurements', [])
+        if not measurements:
+            log.error("Sesión procesada no contiene mediciones para simular")
+            return
+
+        # Usar la primera medición procesada
+        first = measurements[0]
+        # Emitir configuración/metadata previa a la simulación
+        try:
+            event_manager.emit_nowait('cv_config', {
+                'title': first.get('title'),
+                'device_serial': first.get('device_serial'),
+                'curve_count': first.get('curve_count'),
+                'session_info': resultado.get('session_info')
+            }, device_id)
+        except Exception:
+            log.debug("No se pudo emitir cv_config")
+
+        # 'curves' en la estructura resultante contiene listas de puntos dicts
+        curves = first.get('curves') or []
+
+        # Construir lista de puntos iterables
+        points = []
+        for curva in curves:
+            # curva es {'potentials': [...], 'currents': [...]}
+            pots = curva.get('potentials') or []
+            curs = curva.get('currents') or []
+            for i in range(min(len(pots), len(curs))):
+                points.append({
+                    'potential': float(pots[i]),
+                    'current': float(curs[i]),
+                    'timestamp': datetime.datetime.now()
+                })
+
+        if not points:
+            log.error("No se encontraron puntos en la sesión para simular")
+            return
+
+        interval = 1.0 / max(0.1, rate_hz)
+        log.info("Iniciando simulación de streaming desde %s a %.2f Hz (%d puntos)", ruta_archivo, rate_hz, len(points))
+        import time
+        sent = 0
+        for pt in points:
+            if max_points is not None and sent >= max_points:
+                break
+
+            # ajustar timestamp: si measurement tiene timestamp usarlo como base
+            try:
+                base_ts = first.get('timestamp')
+                if base_ts and isinstance(base_ts, datetime.datetime):
+                    # incrementar microsegundos según índice y rate
+                    delta_seconds = sent * interval
+                    pt_ts = base_ts + datetime.timedelta(seconds=delta_seconds)
+                    pt['timestamp'] = pt_ts
+                else:
+                    pt['timestamp'] = datetime.datetime.now()
+            except Exception:
+                pt['timestamp'] = datetime.datetime.now()
+
+            event_manager.emit_nowait('cv_data_point', pt, device_id)
+
+            # registrar heartbeat en background de forma robusta
+            try:
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(event_manager.register_heartbeat(device_id), loop)
+                    else:
+                        # crear loop temporal para registro
+                        asyncio.run(event_manager.register_heartbeat(device_id))
+                except RuntimeError:
+                    # no hay loop asociado al hilo actual
+                    try:
+                        asyncio.run(event_manager.register_heartbeat(device_id))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            sent += 1
+            time.sleep(interval)
+
+        # Al finalizar, calcular estimaciones PPM para la simulación si es posible
+        try:
+            # datos_pca: tomar corrientes del tercer ciclo si existe
+            datos_pca = None
+            if len(curves) >= 3:
+                datos_pca = curves[2].get('currents')
+            elif len(curves) > 0:
+                datos_pca = curves[0].get('currents')
+
+            ppm_result = None
+            if datos_pca:
+                ppm_result = calcular_estimaciones_ppm(datos_pca, limites)
+
+            event_manager.emit_nowait('cv_measurement_complete', {'simulated': True, 'points': len(points), 'ppm': ppm_result}, device_id)
+        except Exception as e:
+            log.debug("Error calculando PPM en simulación: %s", e)
+            event_manager.emit_nowait('cv_measurement_complete', {'simulated': True, 'points': len(points)}, device_id)
+
+    except Exception as e:
+        log.exception("Error en simulate_stream_from_pssession: %s", e)
+        event_manager.emit_nowait('cv_error', {'error': str(e)}, device_id)
 
 def _validar_parametros_cv(params: Dict) -> Dict:
     """Valida y normaliza parámetros CV"""
