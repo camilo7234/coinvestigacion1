@@ -36,3 +36,4 @@ sdk/PSPythonSDK/*Example.*
 # ─── EXCEPCIÓN: permitir TODO dentro del SDK ──────────────────────────────
 !/sdk/PSPythonSDK/
 !/sdk/PSPythonSDK/**
+venv/
