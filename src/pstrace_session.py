@@ -25,6 +25,11 @@ import json
 import datetime
 import traceback
 import csv
+import joblib
+import numpy as np
+from pathlib import Path
+import logging
+log = logging.getLogger(__name__)
 
 # ===================================================================================
 # BLOQUE 1: CONFIGURACIÓN INICIAL CRÍTICA Y DEPENDENCIAS .NET
@@ -661,6 +666,78 @@ def generar_csv_matriz_pca_ppm(resultados_mediciones):
     except Exception as e:
         log.error("✗ Error generando CSV matriz PCA+PPM: %s", traceback.format_exc())
         return False
+    
+
+
+
+# ===================================================================================
+# BLOQUE 9.5: PREDICCIÓN CON MODELO ENTRENADO (train_memory)
+# ===================================================================================
+
+def predecir_con_modelo_entrenado(datos_pca):
+    """
+    Usa los modelos entrenados (scaler, PCA, RidgeCV) para estimar concentración.
+    Se espera que los modelos estén en coinvestigacion1-main/models/.
+    
+    Args:
+        datos_pca (list or np.ndarray): Corrientes (valores Y del ciclo 3)
+    
+    Returns:
+        dict: {'predicciones': [...], 'ppm_promedio': float}
+    """
+    try:
+        import numpy as np
+        from pathlib import Path
+        import joblib
+
+        ROOT = Path(__file__).resolve().parents[1]
+        MODELS_DIR = ROOT / "models"
+
+        scaler_path = MODELS_DIR / "scaler.pkl"
+        pca_path = MODELS_DIR / "pca.pkl"
+        model_path = MODELS_DIR / "model.pkl"
+        meta_path = MODELS_DIR / "meta.pkl"
+
+        # === Validar existencia de modelos ===
+        if not (scaler_path.exists() and pca_path.exists() and model_path.exists()):
+            log.error("✗ Modelos entrenados no encontrados en 'models/'. Ejecuta train_memory.py primero.")
+            return {"predicciones": [], "ppm_promedio": None}
+
+        # === Cargar modelos ===
+        scaler = joblib.load(scaler_path)
+        pca = joblib.load(pca_path)
+        model = joblib.load(model_path)
+        meta = joblib.load(meta_path)
+
+        # === Preprocesar los datos del ciclo voltamétrico ===
+        X = np.array(datos_pca, dtype=float).reshape(1, -1)
+        X = np.nan_to_num(X)
+
+        # Normalizar longitudes si no coincide con lo entrenado
+        n_features = meta.get("n_features", X.shape[1])
+        if X.shape[1] != n_features:
+            if X.shape[1] < n_features:
+                pad_width = n_features - X.shape[1]
+                X = np.pad(X, ((0, 0), (0, pad_width)), 'constant')
+            else:
+                X = X[:, :n_features]
+            log.warning(f"⚠ Ajustando longitud de entrada a {n_features} características")
+
+        # === Aplicar pipeline del modelo ===
+        X_scaled = scaler.transform(X)
+        X_pca = pca.transform(X_scaled)
+        pred = model.predict(X_pca)
+
+        # === Consolidar salida ===
+        ppm_pred = float(np.mean(pred))
+        log.info(f"💧 Predicción completada → ppm promedio: {ppm_pred:.4f}")
+
+        return {"predicciones": pred.flatten().tolist(), "ppm_promedio": ppm_pred}
+
+    except Exception as e:
+        log.error(f"✗ Error en predicción con modelo entrenado: {str(e)}")
+        return {"predicciones": [], "ppm_promedio": None}
+
 
 # ===================================================================================
 # BLOQUE 10: PROCESADOR PRINCIPAL DE SESIONES
@@ -750,6 +827,10 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
 
             # Procesamiento PCA: ahora solo tercer ciclo
             datos_pca = procesar_ciclos_voltametricos(array_curvas)
+            # Predicción con el modelo entrenado
+            resultado_modelo = predecir_con_modelo_entrenado(datos_pca)
+            ppm_predicho = resultado_modelo["ppm_promedio"]
+
             if not datos_pca:
                 log.warning("⚠ No se pudo procesar PCA para medición %d", idx)
                 continue
@@ -783,6 +864,9 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
                 'ppm_estimations': estimaciones_ppm,
                 'clasificacion': clasificacion,
                 'contamination_level': nivel_contaminacion,
+                'ppm_modelo': ppm_predicho,
+
+
                 'pca_points_count': len(datos_pca) if datos_pca else 0
             })
 

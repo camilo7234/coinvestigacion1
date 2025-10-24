@@ -1427,10 +1427,11 @@ class Aplicacion(tk.Tk):
         self.canvas_curve.draw()
         ToolTip(self.canvas_curve.get_tk_widget(), "Aquí ves la(s) curva(s) y su promedio con desviación estándar")
 
-    # ————— Bloque: Mostrar PCA y varianza —————
+       # ————— Bloque: Mostrar PCA y varianza —————
     def show_pca(self):
         """
         Calcula y muestra el PCA de los vectores pca_scores de todas las mediciones.
+        Si existe un PCA entrenado (models/pca.pkl), lo usa para mostrar su varianza real.
         """
         print("[DEBUG] show_pca() invoked")
         if self.current_data is None or "pca_scores" not in self.current_data:
@@ -1440,9 +1441,24 @@ class Aplicacion(tk.Tk):
         # Matriz de datos
         df = pd.DataFrame(self.current_data["pca_scores"].tolist()).fillna(0)
 
-        # Ajuste PCA
-        pca = PCA().fit(df)
-        var = pca.explained_variance_ratio_.cumsum() * 100
+        # === Nuevo bloque: Cargar PCA entrenado ===
+        try:
+            from pathlib import Path
+            import joblib
+
+            pca_path = Path(__file__).resolve().parents[1] / "models" / "pca.pkl"
+            if pca_path.exists():
+                pca = joblib.load(pca_path)
+                print(f"[DEBUG] PCA cargado desde {pca_path}")
+                var = pca.explained_variance_ratio_.cumsum() * 100
+            else:
+                print("[WARNING] No se encontró el PCA entrenado. Recalculando localmente...")
+                pca = PCA().fit(df)
+                var = pca.explained_variance_ratio_.cumsum() * 100
+        except Exception as e:
+            print(f"[ERROR] No se pudo cargar el PCA entrenado: {e}")
+            pca = PCA().fit(df)
+            var = pca.explained_variance_ratio_.cumsum() * 100
 
         # Limpiar ejes
         self.ax_pca.clear()
@@ -1461,7 +1477,6 @@ class Aplicacion(tk.Tk):
 
         # Estética
         self.ax_pca.set_ylim(0, max(110, max(var) + 5))
-
         self.ax_pca.set_title("Varianza Acumulada PCA", color="white")
         self.ax_pca.set_xlabel("Componentes", color="white")
         self.ax_pca.set_ylabel("Varianza (%)", color="white")
@@ -1501,7 +1516,6 @@ class Aplicacion(tk.Tk):
         )
         btn_export_pca.pack(side="right", padx=10, pady=5)
         ToolTip(btn_export_pca, "Exporta la gráfica de PCA como imagen PNG")
-
 
 
     # ————— Bloque: Cargar lista de sesiones (para futuras funciones) —————
