@@ -1,3 +1,6 @@
+# cliente_iot.py - Cliente IoT sincronizado con el panel
+# Usa automáticamente la IP del panel (last_connection.json) o config_cliente.json como respaldo
+
 import socket
 import json
 import os
@@ -6,7 +9,10 @@ import asyncio
 from tqdm import tqdm
 from device_events import event_manager, DeviceEvent
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config_cliente.json")
+BASE_DIR = os.path.dirname(__file__)
+CONFIG_PATH = os.path.join(BASE_DIR, "config_cliente.json")
+LAST_CONN_PATH = os.path.join(BASE_DIR, "last_connection.json")
+
 
 # ...existing code for cargar_config(), guardar_config() and configurar()...
 
@@ -16,10 +22,37 @@ async def enviar_archivo(ruta_archivo):
     if not config:
         print("❌ No se pudo cargar configuración.")
         return
+    host, port = obtener_host_y_puerto()
+    buffer = int(cfg.get("BUFFER_SIZE", 4096))
+    serial = serial or cfg.get("SERIAL", "DESCONOCIDO")
+    size = os.path.getsize(path)
+    checksum = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    header = {
+        "action": "send_file",
+        "filename": os.path.basename(path),
+        "size": size,
+        "checksum": checksum,
+        "serial": serial
+    }
 
-    host = config["HOST"]
-    port = config["PORT"]
-    buffer_size = config["BUFFER_SIZE"]
+    try:
+        with socket.create_connection((host, port)) as s:
+            s.sendall(json.dumps(header).encode() + b"\n")
+            ack = s.recv(16)
+            if not ack or not ack.startswith(b"ACK"):
+                print(f"❌ Servidor no aceptó transferencia ({ack})")
+                return
+            with open(path, "rb") as f, tqdm(total=size, unit="B", unit_scale=True, desc="Enviando") as barra:
+                for chunk in iter(lambda: f.read(buffer), b""):
+                    s.sendall(chunk)
+                    barra.update(len(chunk))
+            try:
+                print("Respuesta final servidor:", s.recv(64))
+            except Exception:
+                pass
+            print("✅ Archivo enviado correctamente.")
+    except Exception as e:
+        print(f"❌ Error enviando archivo a {host}:{port} -> {e}")
 
     if not os.path.exists(ruta_archivo):
         print("❌ Archivo no encontrado:", ruta_archivo)

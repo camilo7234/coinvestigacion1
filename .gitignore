@@ -39,3 +39,4 @@ sdk/PSPythonSDK/*Example.*
 venv/
 
 venv/
+*.pyc

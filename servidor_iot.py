@@ -11,7 +11,9 @@ from src.device_events import event_manager, DeviceEvent
 HOST = "0.0.0.0"  # Escucha en todas las interfaces
 PORT = 5000
 BUFFER_SIZE = 4096
-DEST_DIR = "archivos_recibidos"
+DEST_DIR = os.path.join(os.path.dirname(__file__), "archivos_recibidos")
+IOT_DEVICES_FILE = os.path.join(os.path.dirname(__file__), "iot_devices.json")
+IOT_DATA_FILE = os.path.join(os.path.dirname(__file__), "datos_sensores.json")
 
 # Configuración de logging
 logging.basicConfig(
