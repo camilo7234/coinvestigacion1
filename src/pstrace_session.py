@@ -93,39 +93,116 @@ log = configurar_logging_avanzado()
 def cargar_limites_ppm(ppm_file='limits_ppm.json'):
     """
     Carga los límites de concentración PPM desde archivo JSON
-    
+
     Args:
         ppm_file (str): Ruta al archivo de límites PPM
-        
+
     Returns:
         dict: Diccionario con factores de conversión PPM
               Ejemplo: {"Cd":0.10, "Zn":3.00, "Cu":1.00, "Cr":0.50, "Ni":0.50}
+
+              Además, para trazabilidad científica se añade una clave interna
+              "_limits_version" con metadatos:
+                {
+                  "sha256": <hex>|None,
+                  "mtime": <float_timestamp>|None,
+                  "path": <abs_path>,
+                  "load_error": <str>|None
+                }
+
+              Notas:
+                - No se "inventan" valores: cuando falte alguna clave o el valor
+                  sea inválido, el metal tendrá valor None y se registrará la
+                  razón en los logs. Otras capas del pipeline deben interpretar
+                  None como "límite desconocido" y actuar según la política.
     """
-    limites_por_defecto = {"Cd": None, "Zn": None, "Cu": None, "Cr": None, "Ni": None}
+    import hashlib
+    from pathlib import Path
+
+    # Claves oficiales esperadas
+    claves_oficiales = ["Cd", "Zn", "Cu", "Cr", "Ni"]
+    limites_por_defecto = {k: None for k in claves_oficiales}
+
+    ppm_path = Path(ppm_file)
+
+    # Metadatos de versión iniciales
+    limits_meta = {"sha256": None, "mtime": None, "path": str(ppm_path.resolve()), "load_error": None}
 
     try:
-        if os.path.exists(ppm_file):
-            with open(ppm_file, 'r', encoding='utf-8') as f:
-                limites = json.load(f)
+        if ppm_path.exists():
+            # Leer en bytes para calcular hash y luego decodificar para JSON
+            with open(ppm_path, 'rb') as f:
+                raw = f.read()
 
-            # Normalizar: asegurar que todas las claves existan
-            for metal in limites_por_defecto.keys():
-                if metal not in limites:
+            # SHA256 del archivo (trazabilidad)
+            try:
+                sha256 = hashlib.sha256(raw).hexdigest()
+                limits_meta["sha256"] = sha256
+            except Exception as e:
+                limits_meta["sha256"] = None
+                log.warning("⚠ No se pudo calcular sha256 de %s: %s", ppm_file, str(e))
+
+            # mtime
+            try:
+                limits_meta["mtime"] = ppm_path.stat().st_mtime
+            except Exception:
+                limits_meta["mtime"] = None
+
+            # Decodificar y parsear JSON con defensiva
+            try:
+                text = raw.decode('utf-8')
+                parsed = json.loads(text)
+                if not isinstance(parsed, dict):
+                    raise ValueError("JSON no contiene un objeto/dict en raíz")
+            except Exception as e:
+                limits_meta["load_error"] = f"json_decode_error: {str(e)}"
+                log.error("✗ Error decodificando JSON de límites PPM (%s): %s", ppm_file, str(e))
+                # Devolver defaults con metadatos indicando error
+                resultados = dict(limites_por_defecto)
+                resultados["_limits_version"] = limits_meta
+                return resultados
+
+            # Normalizar: asegurar que todas las claves existan y validar numéricos
+            resultados = {}
+            for metal in claves_oficiales:
+                raw_val = parsed.get(metal, None)
+                if raw_val is None:
+                    resultados[metal] = None
                     log.warning("⚠ Límite para %s no encontrado en JSON, asignando None", metal)
-                    limites[metal] = None
+                else:
+                    try:
+                        val = float(raw_val)
+                        # No aceptamos límites no positivos
+                        if val <= 0.0:
+                            resultados[metal] = None
+                            log.warning("⚠ Límite para %s no válido (<=0): %s", metal, raw_val)
+                        else:
+                            resultados[metal] = val
+                    except Exception:
+                        resultados[metal] = None
+                        log.warning("⚠ Límite para %s no numérico: %s", metal, raw_val)
 
-            log.info("✓ Límites PPM cargados: %s", limites)
-            return limites
+            # Añadir metadatos de versión
+            resultados["_limits_version"] = limits_meta
+
+            log.info("✓ Límites PPM cargados desde %s (version=%s)", ppm_file, limits_meta.get("sha256"))
+            return resultados
+
         else:
+            # Archivo no existe: devolver defaults y marcar metadatos
+            limits_meta["load_error"] = "file_not_found"
+            resultados = dict(limites_por_defecto)
+            resultados["_limits_version"] = limits_meta
             log.warning("⚠ Archivo %s no encontrado, usando configuración por defecto", ppm_file)
-            return limites_por_defecto
-            
-    except json.JSONDecodeError as e:
-        log.error("✗ Error JSON en límites PPM: %s", str(e))
-        return limites_por_defecto
+            return resultados
+
     except Exception as e:
-        log.error("✗ Error cargando límites PPM: %s", str(e))
-        return limites_por_defecto
+        # Fallback por error inesperado: devolver defaults con nota de error
+        limits_meta["load_error"] = f"unexpected_error: {str(e)}"
+        resultados = dict(limites_por_defecto)
+        resultados["_limits_version"] = limits_meta
+        log.error("✗ Error cargando límites PPM: %s", traceback.format_exc())
+        return resultados
 
 # ===================================================================================
 # BLOQUE 4: CONFIGURACIÓN Y CARGA DEL SDK PALMSENS
@@ -286,69 +363,131 @@ def calcular_estimaciones_ppm(datos_pca, limites_ppm):
     """
     Calcula estimaciones de concentración PPM basadas en los límites oficiales
     definidos en el archivo JSON.
-    
+
     - Usa los valores PCA como indicadores de contaminación
     - Compara contra cada metal definido en limites_ppm
-    - Devuelve un diccionario {metal: porcentaje_del_límite, ..., "clasificacion": str}
-    
+    - Devuelve un diccionario con, por cada metal, un sub-dict:
+         { "ppm": float|null, "pct_of_limit": float|null, "note": str|null }
+      donde:
+        - "ppm" es la estimación en ppm (si es posible obtenerla; por defecto None)
+        - "pct_of_limit" es el porcentaje respecto al límite legal (valor usado para
+           decisiones/reglas: 120% → CONTAMINADA, 100% → ANÓMALA, 80% → EN ATENCIÓN)
+        - "note" contiene información de validación (por ejemplo "missing_limit")
+    - Además devuelve claves auxiliares: "clasificacion" (texto), "max_pct" (float),
+      y "method" (metodología usada para la estimación).
+
     Args:
         datos_pca (list): Datos PCA procesados (valores numéricos representativos)
         limites_ppm (dict): Límites legales de metales (ej. {"Cd":0.1,"Zn":3.0,...})
-        
+
     Returns:
-        dict: Porcentaje del límite legal para cada metal + clasificación global
-              Ejemplo: {"Cd": 25.0, "Zn": 3.2, "Cu": 120.0, "Cr": 10.0, "Ni": 5.0,
-                        "clasificacion": "CONTAMINADA"}
+        dict: Estructura:
+          {
+            "Cd": {"ppm": None, "pct_of_limit": 12.3, "note": None},
+            "Zn": {"ppm": None, "pct_of_limit": None, "note": "missing_limit"},
+            ...
+            "clasificacion": "SEGURA",
+            "max_pct": 12.3,
+            "method": "pca_peak_vs_limit"
+          }
     """
     if not datos_pca:
         log.warning("⚠ No hay datos PCA para calcular PPM")
         return {}
 
     try:
-        # 1. Valor representativo: se toma el máximo del PCA como referencia
-        valor_pico = max(datos_pca)
-        log.info("🔎 Valor pico PCA usado para estimación: %.4f", valor_pico)
+        # 1. Obtener un valor representativo desde datos_pca (aquí: valor pico)
+        try:
+            valor_pico = float(max(datos_pca))
+        except Exception as e:
+            log.error("✗ No se pudo extraer valor_pico de 'datos_pca': %s", e)
+            return {}
 
-        # 2. Calcular porcentaje del límite legal para cada metal
+        log.info("🔎 Valor pico PCA usado para estimación: %.6f", valor_pico)
+
+        # 2. Preparar resultados por metal con formato claro y trazable
         resultados = {}
         clasificacion = "SEGURA"  # valor inicial
-        max_superacion = 0        # para determinar la clasificación global
+        max_superacion_pct = 0.0  # para determinar la clasificación global
 
-        for metal in ["Cd", "Zn", "Cu", "Cr", "Ni"]:
-            limite = limites_ppm.get(metal)
-            if limite and limite > 0:
-                # Calcular porcentaje de superación respecto al límite
-                porcentaje = (valor_pico / limite) * 100
-                resultados[metal] = porcentaje
-                log.debug("  %s: %.2f %% del límite (%.3f ppm)", metal, porcentaje, limite)
+        # Lista ordenada de metales (consistente en todo el pipeline)
+        metales = ["Cd", "Zn", "Cu", "Cr", "Ni"]
 
-                # Guardar el máximo porcentaje de superación
-                if porcentaje > max_superacion:
-                    max_superacion = porcentaje
-            else:
-                resultados[metal] = None
-                log.warning("⚠ Límite no válido o ausente para %s en JSON", metal)
+        for metal in metales:
+            # Inicializar sub-dict por metal
+            resultados[metal] = {"ppm": None, "pct_of_limit": None, "note": None}
 
-        # 3. Determinar clasificación global en función del máximo porcentaje
-        if max_superacion >= 120:
+            # Intentar extraer límite numérico para el metal
+            limite = None
+            try:
+                if isinstance(limites_ppm, dict):
+                    limite = limites_ppm.get(metal)
+            except Exception:
+                limite = None
+
+            # Validaciones del límite
+            if limite is None:
+                resultados[metal]["note"] = "missing_limit"
+                log.warning("⚠ Límite para %s ausente en limites_ppm", metal)
+                continue
+
+            try:
+                limite_val = float(limite)
+            except Exception:
+                resultados[metal]["note"] = "invalid_limit"
+                log.warning("⚠ Límite para %s no numérico: %s", metal, limite)
+                continue
+
+            if limite_val <= 0.0:
+                resultados[metal]["note"] = "invalid_limit_nonpositive"
+                log.warning("⚠ Límite para %s no válido (<=0): %s", metal, limite_val)
+                continue
+
+            # Calcular porcentaje respecto al límite: (valor_pico / limite) * 100
+            try:
+                pct = (valor_pico / limite_val) * 100.0
+                # Validar numérico
+                pct = float(pct)
+                if pct != pct or pct in (float("inf"), float("-inf")):
+                    raise ValueError("porcentaje inválido")
+            except Exception:
+                resultados[metal]["note"] = "calc_error"
+                log.warning("⚠ Resultado no numérico para %s (valor_pico=%s, limite=%s)", metal, valor_pico, limite_val)
+                continue
+
+            # Guardar pct_of_limit y dejar ppm como None (salvo que exista calibración externa)
+            resultados[metal]["pct_of_limit"] = pct
+            resultados[metal]["ppm"] = None  # No estimamos ppm directo aquí
+            resultados[metal]["note"] = None
+
+            log.debug("  %s: %.2f %% del límite (límite=%.6f)", metal, pct, limite_val)
+
+            # Actualizar máximo porcentaje observado
+            if pct > max_superacion_pct:
+                max_superacion_pct = pct
+
+        # 3. Determinar clasificación global en función del máximo porcentaje (pct_of_limit)
+        if max_superacion_pct >= 120.0:
             clasificacion = "CONTAMINADA"
-        elif max_superacion >= 100:
+        elif max_superacion_pct >= 100.0:
             clasificacion = "ANÓMALA"
-        elif max_superacion >= 80:
+        elif max_superacion_pct >= 80.0:
             clasificacion = "EN ATENCIÓN"
         else:
             clasificacion = "SEGURA"
 
+        # Añadir metadatos auxiliares para trazabilidad
         resultados["clasificacion"] = clasificacion
-        log.info("🏷 Clasificación global del agua: %s (%.2f%% máx. superación)", clasificacion, max_superacion)
+        resultados["max_pct"] = float(max_superacion_pct)
+        resultados["method"] = "pca_peak_vs_limit"
+
+        log.info("🏷 Clasificación global del agua: %s (%.2f%% máx. superación)", clasificacion, max_superacion_pct)
 
         return resultados
 
     except Exception:
         log.error("✗ Error calculando estimaciones PPM: %s", traceback.format_exc())
         return {}
-
-
 
 # ===================================================================================
 # BLOQUE 7.5: SISTEMA DE CLASIFICACIÓN AVANZADO
@@ -591,6 +730,13 @@ def generar_csv_matriz_pca_ppm(resultados_mediciones):
     """
     Genera archivo CSV con matriz PCA y estimaciones PPM
     Implementa formato estructurado según especificaciones
+
+    NOTA (investigación):
+      - Este CSV contiene tanto los porcentajes respecto al límite legal
+        (ej. 'Cd_pct' = % del límite) como la predicción global del modelo
+        ('ppm_modelo') cuando esté disponible. Además se añaden campos de
+        trazabilidad del modelo usados en la predicción por medición.
+      - Evitamos ambigüedades renombrando explícitamente las columnas.
     
     Args:
         resultados_mediciones (list): Lista de mediciones procesadas
@@ -603,7 +749,7 @@ def generar_csv_matriz_pca_ppm(resultados_mediciones):
         return False
     
     try:
-        # Determinar longitud de datos PCA
+        # Determinar longitud de datos PCA a partir del primer resultado
         primer_resultado = resultados_mediciones[0]
         longitud_pca = len(primer_resultado.get('pca_scores', []))
         
@@ -611,12 +757,25 @@ def generar_csv_matriz_pca_ppm(resultados_mediciones):
             log.warning("⚠ No hay datos PCA para generar CSV")
             return False
         
-        # Construir encabezados dinámicos
+        # Construir encabezados dinámicos de forma explícita y con unidades claras
         encabezados = ['sensor_id', 'measurement_title']
-        encabezados += [f'punto_{i+1}' for i in range(longitud_pca)]  # Puntos PCA
-        # Encabezados fijos para metales y clasificación
-        encabezados += ['Cd_ppm', 'Zn_ppm', 'Cu_ppm', 'Cr_ppm', 'Ni_ppm',
-                        'contamination_level', 'clasificacion']
+        encabezados += [f'punto_{i+1}' for i in range(longitud_pca)]  # Puntos PCA / corriente del ciclo 3
+        
+        # Columnas de porcentaje respecto al límite legal (unidad: %)
+        encabezados += ['Cd_pct', 'Zn_pct', 'Cu_pct', 'Cr_pct', 'Ni_pct']
+        # Columna con la predicción global del modelo (si existe) en ppm (unidad: ppm)
+        encabezados += ['ppm_modelo']
+        # Nivel de contaminación (máx % detectado) y clasificación textual
+        encabezados += ['contamination_level_pct', 'clasificacion']
+        
+        # Metadatos del modelo por fila (trazabilidad)
+        encabezados += [
+            'model_version',
+            'model_used_n_features',
+            'model_used_baseline',
+            'model_baseline_source',
+            'model_notes'
+        ]
         
         # Crear directorio de salida
         directorio_data = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data'))
@@ -632,6 +791,7 @@ def generar_csv_matriz_pca_ppm(resultados_mediciones):
             # Escribir encabezados
             escritor.writerow(encabezados)
             
+            registros_escritos = 0
             # Escribir datos de cada medición
             for resultado in resultados_mediciones:
                 fila_datos = [
@@ -640,26 +800,74 @@ def generar_csv_matriz_pca_ppm(resultados_mediciones):
                 ]
                 
                 # Agregar datos PCA (ciclo 3 ya procesado en Bloque 10)
-                datos_pca = resultado.get('pca_scores', [])
-                fila_datos.extend(datos_pca)
+                datos_pca = resultado.get('pca_scores', []) or []
                 
-                # Agregar estimaciones PPM (diccionario por metal)
-                estimaciones_ppm = resultado.get('ppm_estimations', {})
-                fila_datos.append(estimaciones_ppm.get('Cd'))
-                fila_datos.append(estimaciones_ppm.get('Zn'))
-                fila_datos.append(estimaciones_ppm.get('Cu'))
-                fila_datos.append(estimaciones_ppm.get('Cr'))
-                fila_datos.append(estimaciones_ppm.get('Ni'))
+                # Asegurar que cada fila tenga exactamente 'longitud_pca' valores:
+                # - si faltan, se rellenan con None (campo vacío en CSV)
+                # - si sobran, se truncan (manteniendo consistencia con encabezados)
+                if len(datos_pca) < longitud_pca:
+                    padding = [None] * (longitud_pca - len(datos_pca))
+                    datos_pca_row = list(datos_pca) + padding
+                else:
+                    datos_pca_row = list(datos_pca[:longitud_pca])
+                
+                fila_datos.extend(datos_pca_row)
+                
+                # Agregar estimaciones PPM (diccionario por metal) - se asume que
+                # calcular_estimaciones_ppm devuelve porcentajes (pct) por diseño.
+                estimaciones_ppm = resultado.get('ppm_estimations', {}) or {}
+                def _safe_get_pct(d, k):
+                    v = d.get(k)
+                    # Si v es dict y contiene 'pct' o 'pct_of_limit', extraerlo
+                    if isinstance(v, dict):
+                        return v.get('pct_of_limit') or v.get('pct') or None
+                    # Si es numérico, devolverlo
+                    try:
+                        return float(v) if v is not None else None
+                    except Exception:
+                        return None
+                
+                fila_datos.append(_safe_get_pct(estimaciones_ppm, 'Cd'))
+                fila_datos.append(_safe_get_pct(estimaciones_ppm, 'Zn'))
+                fila_datos.append(_safe_get_pct(estimaciones_ppm, 'Cu'))
+                fila_datos.append(_safe_get_pct(estimaciones_ppm, 'Cr'))
+                fila_datos.append(_safe_get_pct(estimaciones_ppm, 'Ni'))
+                
+                # Agregar predicción global del modelo en ppm (si existe)
+                ppm_modelo = resultado.get('ppm_modelo', None)
+                try:
+                    ppm_modelo_val = float(ppm_modelo) if ppm_modelo is not None else None
+                except Exception:
+                    ppm_modelo_val = None
+                fila_datos.append(ppm_modelo_val)
                 
                 # Agregar nivel de contaminación y clasificación global
-                fila_datos.append(resultado.get('contamination_level', 0))
+                # 'contamination_level' en el resultado ya representa % (según Bloque 10)
+                contamination_level = resultado.get('contamination_level', None)
+                try:
+                    contamination_level_val = float(contamination_level) if contamination_level is not None else None
+                except Exception:
+                    contamination_level_val = None
+                fila_datos.append(contamination_level_val)
                 fila_datos.append(resultado.get('clasificacion', 'DESCONOCIDA'))
                 
-                escritor.writerow(fila_datos)
+                # Agregar metadatos del modelo (si existen)
+                model_meta = resultado.get('model_meta', {}) or {}
+                fila_datos.append(model_meta.get('model_version'))
+                fila_datos.append(model_meta.get('used_n_features'))
+                fila_datos.append(bool(model_meta.get('used_baseline')))
+                fila_datos.append(model_meta.get('baseline_source'))
+                fila_datos.append(model_meta.get('notes'))
+                
+                # Normalizar valores None a '' para CSV (mejora legibilidad)
+                fila_datos_csv = [("" if v is None else v) for v in fila_datos]
+                
+                escritor.writerow(fila_datos_csv)
+                registros_escritos += 1
         
         log.info("✓ CSV matriz PCA+PPM generado exitosamente: %s", ruta_csv)
-        log.info("  Registros escritos: %d", len(resultados_mediciones))
-        log.info("  Columnas PCA: %d, Columnas PPM: %d + nivel y clasificación", longitud_pca, 5)
+        log.info("  Registros escritos: %d", registros_escritos)
+        log.info("  Columnas PCA: %d, Columnas PCT por metal: %d, plus ppm_modelo y metadatos", longitud_pca, 5)
         
         return True
         
@@ -678,17 +886,38 @@ def predecir_con_modelo_entrenado(datos_pca):
     """
     Usa los modelos entrenados (scaler, PCA, RidgeCV) para estimar concentración.
     Se espera que los modelos estén en coinvestigacion1-main/models/.
-    
+
+    Robustez y trazabilidad añadidas:
+      - Validaciones de existencia de artefactos.
+      - Carga segura de meta.pkl (si existe).
+      - Alineado de número de features (padding/truncado) con registro en metadata.
+      - Búsqueda de baseline en varios orígenes (meta.pkl, baseline.npy en models/).
+      - Política conservadora por defecto: SI NO HAY baseline certificada, NO restar
+        la media del propio sample (evita introducir sesgos).
+      - Fallbacks documentados para el escalado (scaler.mean_/scale_) y para PCA/predicción.
+      - Devolución enriquecida con `model_meta` para auditoría científica.
+
     Args:
         datos_pca (list or np.ndarray): Corrientes (valores Y del ciclo 3)
-    
+
     Returns:
-        dict: {'predicciones': [...], 'ppm_promedio': float}
+        dict: {
+            'predicciones': [...],
+            'ppm_promedio': float|None,
+            'model_meta': {
+                'model_version': str|None,
+                'used_n_features': int,
+                'used_baseline': bool,
+                'baseline_source': str|None,
+                'notes': str|None
+            }
+        }
     """
     try:
         import numpy as np
         from pathlib import Path
         import joblib
+        import traceback
 
         ROOT = Path(__file__).resolve().parents[1]
         MODELS_DIR = ROOT / "models"
@@ -701,42 +930,214 @@ def predecir_con_modelo_entrenado(datos_pca):
         # === Validar existencia de modelos ===
         if not (scaler_path.exists() and pca_path.exists() and model_path.exists()):
             log.error("✗ Modelos entrenados no encontrados en 'models/'. Ejecuta train_memory.py primero.")
-            return {"predicciones": [], "ppm_promedio": None}
+            return {"predicciones": [], "ppm_promedio": None, "model_meta": {
+                "model_version": None, "used_n_features": None, "used_baseline": False, "baseline_source": None,
+                "notes": "missing_models"
+            }}
 
-        # === Cargar modelos ===
-        scaler = joblib.load(scaler_path)
-        pca = joblib.load(pca_path)
-        model = joblib.load(model_path)
-        meta = joblib.load(meta_path)
+        # === Cargar modelos con manejo de errores ===
+        try:
+            scaler = joblib.load(scaler_path)
+            pca = joblib.load(pca_path)
+            model = joblib.load(model_path)
+        except Exception as e:
+            log.error("✗ Error cargando artefactos del modelo: %s", str(e))
+            log.debug(traceback.format_exc())
+            return {"predicciones": [], "ppm_promedio": None, "model_meta": {
+                "model_version": None, "used_n_features": None, "used_baseline": False, "baseline_source": None,
+                "notes": "load_error"
+            }}
 
-        # === Preprocesar los datos del ciclo voltamétrico ===
-        X = np.array(datos_pca, dtype=float).reshape(1, -1)
+        # Cargar metadata si existe
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = joblib.load(meta_path) or {}
+            except Exception as e:
+                log.warning("⚠ No se pudo cargar 'meta.pkl' correctamente: %s — continuando sin meta", str(e))
+                meta = {}
+
+        # === Preparar entrada X ===
+        try:
+            X = np.array(datos_pca, dtype=float).reshape(1, -1)
+        except Exception as e:
+            log.error("✗ Datos de entrada inválidos para predicción: %s", str(e))
+            return {"predicciones": [], "ppm_promedio": None, "model_meta": {
+                "model_version": meta.get("model_version"), "used_n_features": None, "used_baseline": False,
+                "baseline_source": None, "notes": "invalid_input"
+            }}
         X = np.nan_to_num(X)
 
-        # Normalizar longitudes si no coincide con lo entrenado
-        n_features = meta.get("n_features", X.shape[1])
+        # === Determinar n_features entrenadas (orden de preferencia) ===
+        # 1) meta['n_features'] 2) scaler.mean_.shape[0] 3) X.shape[1] (fallback)
+        n_features = None
+        if isinstance(meta.get("n_features"), int):
+            n_features = int(meta.get("n_features"))
+        else:
+            scaler_mean = getattr(scaler, "mean_", None)
+            if scaler_mean is not None:
+                try:
+                    n_features = int(np.asarray(scaler_mean).ravel().shape[0])
+                except Exception:
+                    n_features = None
+
+        if n_features is None:
+            n_features = X.shape[1]
+
+        model_meta = {
+            "model_version": meta.get("model_version") or getattr(model, "version", None),
+            "used_n_features": int(n_features),
+            "used_baseline": False,
+            "baseline_source": None,
+            "notes": None
+        }
+
+        # === Alineado de longitudes ===
         if X.shape[1] != n_features:
-            if X.shape[1] < n_features:
-                pad_width = n_features - X.shape[1]
-                X = np.pad(X, ((0, 0), (0, pad_width)), 'constant')
-            else:
-                X = X[:, :n_features]
-            log.warning(f"⚠ Ajustando longitud de entrada a {n_features} características")
+            try:
+                if X.shape[1] < n_features:
+                    pad_width = n_features - X.shape[1]
+                    X = np.pad(X, ((0, 0), (0, pad_width)), 'constant', constant_values=0.0)
+                    model_meta["notes"] = (model_meta.get("notes") or "") + f" padded_{pad_width}"
+                else:
+                    X = X[:, :n_features]
+                    model_meta["notes"] = (model_meta.get("notes") or "") + f" truncated_to_{n_features}"
+                log.warning("⚠ Ajustando longitud de entrada a %d características (padding/truncado aplicado)", n_features)
+            except Exception as e:
+                log.error("✗ Error ajustando longitud de entrada: %s", str(e))
+                log.debug(traceback.format_exc())
+                return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
 
-        # === Aplicar pipeline del modelo ===
-        X_scaled = scaler.transform(X)
-        X_pca = pca.transform(X_scaled)
-        pred = model.predict(X_pca)
+        # === Estrategia de baseline (orden de búsqueda y política conservadora) ===
+        # Preferencia de orígenes: meta['baseline'|'blank_vector'|'baseline_vector'] -> models/baseline.npy -> NONE
+        baseline_vector = None
+        baseline_source = None
+        for key in ("baseline", "blank_vector", "baseline_vector", "baseline_mean_vector"):
+            if key in meta and meta.get(key) is not None:
+                try:
+                    bv = np.array(meta.get(key), dtype=float).reshape(1, -1)
+                    # ajustar baseline si difiere en longitud
+                    if bv.shape[1] != n_features:
+                        if bv.shape[1] < n_features:
+                            pad_w = n_features - bv.shape[1]
+                            bv = np.pad(bv, ((0, 0), (0, pad_w)), 'constant', constant_values=0.0)
+                        else:
+                            bv = bv[:, :n_features]
+                    baseline_vector = bv
+                    baseline_source = f"meta:{key}"
+                    break
+                except Exception:
+                    baseline_vector = None
+                    baseline_source = None
 
-        # === Consolidar salida ===
-        ppm_pred = float(np.mean(pred))
-        log.info(f"💧 Predicción completada → ppm promedio: {ppm_pred:.4f}")
+        # Intentar cargar baseline.npy en models/
+        if baseline_vector is None:
+            candidate = MODELS_DIR / "baseline.npy"
+            if candidate.exists():
+                try:
+                    bv = np.load(candidate)
+                    bv = np.array(bv, dtype=float).reshape(1, -1)
+                    if bv.shape[1] != n_features:
+                        if bv.shape[1] < n_features:
+                            pad_w = n_features - bv.shape[1]
+                            bv = np.pad(bv, ((0, 0), (0, pad_w)), 'constant', constant_values=0.0)
+                        else:
+                            bv = bv[:, :n_features]
+                    baseline_vector = bv
+                    baseline_source = "models/baseline.npy"
+                except Exception:
+                    baseline_vector = None
+                    baseline_source = None
 
-        return {"predicciones": pred.flatten().tolist(), "ppm_promedio": ppm_pred}
+        # Política: por seguridad científica, NO restamos la media del propio sample automáticamente.
+        # Solo restamos si hay baseline confiable encontrada y cargada.
+        if baseline_vector is not None:
+            try:
+                X = X - baseline_vector
+                model_meta["used_baseline"] = True
+                model_meta["baseline_source"] = baseline_source
+                log.info("✓ Baseline restado antes del escalado (origen=%s).", baseline_source)
+            except Exception as e:
+                log.warning("⚠ Falló resta de baseline (%s): %s — procediendo sin baseline", baseline_source, str(e))
+                model_meta["used_baseline"] = False
+                model_meta["baseline_source"] = None
+        else:
+            # Comportamiento conservador: NO restar baseline inferida del sample.
+            model_meta["used_baseline"] = False
+            model_meta["baseline_source"] = None
+            log.info("ℹ No se encontró baseline certificada en meta/models — no se resta baseline (política conservadora).")
 
-    except Exception as e:
-        log.error(f"✗ Error en predicción con modelo entrenado: {str(e)}")
-        return {"predicciones": [], "ppm_promedio": None}
+        # === Escalado con el scaler entrenado (esperado StandardScaler o similar) ===
+        try:
+            # Preferir scaler.transform (mantener consistencia con entrenamiento)
+            X_scaled = scaler.transform(X)
+        except Exception as e:
+            log.warning("⚠ scaler.transform falló: %s — intentando fallback con mean_/scale_ si están disponibles", str(e))
+            try:
+                mean_ = getattr(scaler, "mean_", None)
+                scale_ = getattr(scaler, "scale_", None)
+                if mean_ is not None and scale_ is not None:
+                    mean_arr = np.array(mean_, dtype=float).reshape(1, -1)
+                    scale_arr = np.array(scale_, dtype=float).reshape(1, -1)
+                    # Evitar dividir por cero
+                    scale_arr[scale_arr == 0] = 1.0
+                    X_scaled = (X - mean_arr) / scale_arr
+                    log.warning("⚠ Fallback: normalización manual usando mean_/scale_ del scaler")
+                else:
+                    # Último recurso: normalizar por la desviación de la muestra (no ideal)
+                    mu = np.mean(X, axis=0, keepdims=True)
+                    sigma = np.std(X, axis=0, keepdims=True)
+                    sigma[sigma == 0] = 1.0
+                    X_scaled = (X - mu) / sigma
+                    log.warning("⚠ Fallback extremo: z-score calculado desde la muestra (no recomendado)")
+            except Exception as e2:
+                log.error("✗ Fallback de escalado fallido: %s", str(e2))
+                log.debug(traceback.format_exc())
+                return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
+
+        # === Transformación PCA y predicción con modelo ===
+        try:
+            X_pca = pca.transform(X_scaled)
+        except Exception as e:
+            log.error("✗ Error en pca.transform: %s", str(e))
+            log.debug(traceback.format_exc())
+            return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
+
+        try:
+            pred = model.predict(X_pca)
+        except Exception as e:
+            log.error("✗ Error en model.predict: %s", str(e))
+            log.debug(traceback.format_exc())
+            return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
+
+        # === Validación de salida y consolidación ===
+        try:
+            pred_arr = np.asarray(pred).flatten()
+            ppm_pred = float(np.mean(pred_arr)) if pred_arr.size > 0 else None
+            log.info("💧 Predicción completada → ppm promedio: %s", f"{ppm_pred:.4f}" if ppm_pred is not None else "None")
+        except Exception as e:
+            log.error("✗ Error consolidando predicciones: %s", str(e))
+            log.debug(traceback.format_exc())
+            return {"predicciones": [], "ppm_promimo": None, "model_meta": model_meta}
+
+        # Enriquecer notas finales
+        if not model_meta.get("notes"):
+            model_meta["notes"] = "ok"
+        else:
+            model_meta["notes"] = model_meta["notes"].strip()
+
+        return {
+            "predicciones": pred_arr.tolist(),
+            "ppm_promedio": ppm_pred,
+            "model_meta": model_meta
+        }
+
+    except Exception:
+        log.error("✗ Error en predicción con modelo entrenado: %s", traceback.format_exc())
+        return {"predicciones": [], "ppm_promedio": None, "model_meta": {
+            "model_version": None, "used_n_features": None, "used_baseline": False, "baseline_source": None,
+            "notes": "unexpected_error"
+        }}
 
 
 # ===================================================================================
@@ -829,7 +1230,7 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
             datos_pca = procesar_ciclos_voltametricos(array_curvas)
             # Predicción con el modelo entrenado
             resultado_modelo = predecir_con_modelo_entrenado(datos_pca)
-            ppm_predicho = resultado_modelo["ppm_promedio"]
+            ppm_predicho = resultado_modelo.get("ppm_promedio")
 
             if not datos_pca:
                 log.warning("⚠ No se pudo procesar PCA para medición %d", idx)
@@ -838,21 +1239,47 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
             # Calcular estimaciones PPM contra límites oficiales
             estimaciones_ppm = calcular_estimaciones_ppm(datos_pca, limites_ppm)
 
-            # Determinar nivel de contaminación como % de superación máxima
-            nivel_contaminacion = 0
-            for metal, limite in limites_ppm.items():
-                valor = estimaciones_ppm.get(metal)
-                if valor is not None and limite > 0:
-                    porcentaje = (valor / limite) * 100
-                    if porcentaje > nivel_contaminacion:
-                        nivel_contaminacion = porcentaje
+            # Determinar nivel de contaminación correctamente usando los porcentajes ya calculados
+            nivel_contaminacion = 0.0
+
+            # Recorremos metales en orden conocido; soportamos dos formatos:
+            #  - estimaciones_ppm[metal] == porcentaje (float)  OR
+            #  - estimaciones_ppm[metal] == {"pct_of_limit": porcentaje, ...}
+            for metal in ["Cd", "Zn", "Cu", "Cr", "Ni"]:
+                pct_val = None
+                try:
+                    if isinstance(estimaciones_ppm, dict):
+                        v = estimaciones_ppm.get(metal)
+                        if isinstance(v, dict):
+                            # compatibilidad futura: extraer pct_of_limit si está presente
+                            pct_val = v.get("pct_of_limit") if "pct_of_limit" in v else v.get("pct")
+                        else:
+                            # formato histórico: directamente porcentaje numérico
+                            pct_val = v
+                    else:
+                        pct_val = None
+                except Exception:
+                    pct_val = None
+
+                # Normalizar y validar numérico
+                try:
+                    if pct_val is not None:
+                        pct_val = float(pct_val)
+                        # ignorar NaN/Inf
+                        if pct_val != pct_val or pct_val in (float("inf"), float("-inf")):
+                            raise ValueError("valor no numérico")
+                        if pct_val > nivel_contaminacion:
+                            nivel_contaminacion = pct_val
+                except Exception:
+                    # ignorar valores inválidos
+                    continue
 
             # Determinar clasificación textual
-            if nivel_contaminacion >= 120:
+            if nivel_contaminacion >= 120.0:
                 clasificacion = "⚠️ CONTAMINACIÓN SEVERA"
-            elif nivel_contaminacion >= 100:
+            elif nivel_contaminacion >= 100.0:
                 clasificacion = "⚡ CONTAMINACIÓN MODERADA"
-            elif nivel_contaminacion >= 80:
+            elif nivel_contaminacion >= 80.0:
                 clasificacion = "🟡 REQUIERE ATENCIÓN"
             else:
                 clasificacion = "✅ NIVEL SEGURO"
@@ -865,8 +1292,6 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
                 'clasificacion': clasificacion,
                 'contamination_level': nivel_contaminacion,
                 'ppm_modelo': ppm_predicho,
-
-
                 'pca_points_count': len(datos_pca) if datos_pca else 0
             })
 

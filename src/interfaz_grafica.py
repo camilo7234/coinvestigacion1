@@ -1168,15 +1168,53 @@ class Aplicacion(tk.Tk):
             print("[DEBUG] show_ppm: columna 'ppm_estimations' no existe en DataFrame")
             return
 
-        # Construir dataframe con nombres de metales
+        # Construir dataframe con nombres de metales.
+        # Cada fila en current_data['ppm_estimations'] puede contener:
+        #  - antiguo: {metal: float}
+        #  - nuevo: {metal: {'ppm': float, 'pct_of_limit': float, 'note': str}}
         metales = list(self.limites_ppm.keys())
-        df = (
-            pd.DataFrame(
-                self.current_data["ppm_estimations"].tolist(),
-                columns=metales
-            )
-            .fillna(0)
-        )
+
+        # Normalizar cada fila a un valor numérico en ppm si es posible.
+        def _normalize_row(row_dict):
+            out = {}
+            for metal in metales:
+                out_val = None
+                try:
+                    if not isinstance(row_dict, dict):
+                        out[metal] = None
+                        continue
+
+                    raw = row_dict.get(metal)
+                    if raw is None:
+                        out_val = None
+                    elif isinstance(raw, dict):
+                        # preferir 'ppm' si existe
+                        ppmv = raw.get('ppm')
+                        pct = raw.get('pct_of_limit')
+                        if ppmv is not None:
+                            out_val = float(ppmv)
+                        elif pct is not None and metal in self.limites_ppm:
+                            try:
+                                limit = float(self.limites_ppm.get(metal))
+                                out_val = float(pct) / 100.0 * limit
+                            except Exception:
+                                out_val = None
+                        elif pct is not None:
+                            # No tenemos límite; dejar como pct (no ideal) => None
+                            out_val = None
+                    else:
+                        # antiguo valor numérico
+                        try:
+                            out_val = float(raw)
+                        except Exception:
+                            out_val = None
+                except Exception:
+                    out_val = None
+                out[metal] = out_val
+            return out
+
+        rows = [ _normalize_row(x) for x in self.current_data["ppm_estimations"] ]
+        df = pd.DataFrame(rows, columns=metales).fillna(0)
         self.ppm_df = df
 
         # Configurar columnas del Treeview
@@ -1185,12 +1223,19 @@ class Aplicacion(tk.Tk):
             self.tree_ppm.heading(metal, text=metal)
         self.tree_ppm.delete(*self.tree_ppm.get_children())
 
-        # Poblar filas y resaltar alertas
+        # Poblar filas y resaltar alertas (comparando con límites en ppm)
         for _, row in df.iterrows():
-            alerta = any(
-                row[metal] > self.limites_ppm.get(metal, float("inf"))
-                for metal in metales
-            )
+            alerta = False
+            for metal in metales:
+                try:
+                    val = float(row[metal])
+                    limit = float(self.limites_ppm.get(metal, float('inf')))
+                    if val > limit:
+                        alerta = True
+                        break
+                except Exception:
+                    continue
+
             tag = "alert" if alerta else ""
             self.tree_ppm.insert("", "end", values=list(row), tags=(tag,))
 
