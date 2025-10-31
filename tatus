@@ -1,0 +1,45 @@
+.gitignore
+.gitignore.backup
+APUNTES.txt
+archivos_recibidos/CV SPE-M41.pssession
+cliente_iot.py
+data/Captura de pantalla 2025-03-01 150555.png
+data/Datos de referencia_laboratorio, matriz_2_UNAL 191925 .xlsx
+data/INFORME 2.pdf
+data/INFORME3.pdf
+data/INFORME4.pdf
+data/INFORME5.pdf
+data/INFORME6.pdf
+data/Informe_Tecnico_Coinvestigacion1.docx
+data/PSTrace-5.6-Manual.pdf
+data/R.png
+data/f.png
+data/informe 7.pdf
+data/informe 8.pdf
+data/informe 9.pdf
+data/informe.pdf
+data/matriz_pca.csv
+es.txt
+models/meta.pkl
+models/model.pkl
+models/pca.pkl
+models/scaler.pkl
+proyecto.txt
+pstrace_debug.log
+sdk/PSPythonSDK/pspython/__pycache__/__init__.cpython-313.pyc
+sdk/PSPythonSDK/pspython/__pycache__/pspydata.cpython-313.pyc
+sdk/PSPythonSDK/pspython/__pycache__/pspyfiles.cpython-313.pyc
+sdk/PSPythonSDK/pspython/__pycache__/pspyinstruments.cpython-313.pyc
+sdk/PSPythonSDK/pspython/__pycache__/pspymethods.cpython-310.pyc
+sdk/PSPythonSDK/pspython/__pycache__/pspymethods.cpython-313.pyc
+sdk/PSPythonSDK/pspython/__pycache__/pspymethods.cpython-38.pyc
+servidor_iot.py
+settings.json
+src/db_connection.py
+src/insert_data.py
+src/interfaz_grafica.py
+src/limits_ppm.json
+src/preprocess.py
+src/pstrace_connection.py
+src/pstrace_session.py
+src/train_memory.py
