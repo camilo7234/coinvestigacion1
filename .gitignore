@@ -1,0 +1,40 @@
+﻿#  Entornos virtuales & cachés Python 
+.venv/
+__pycache__/
+*.py[cod]
+
+#  IDE & Editor 
+.vscode/
+settings.json
+
+#  Logs & Debug 
+*.log
+
+#  Archivos sensibles 
+*.env
+
+#  Temporales & Sistema 
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+#  SDK demos NO versionar 
+sdk/PSPythonSDK/*.pssession
+sdk/PSPythonSDK/*.psmethod
+sdk/PSPythonSDK/*Example.*
+
+#  Ignorar docs/imágenes y datos fuera de `data/` 
+*.pdf
+*.csv
+*.png
+*.jpg
+*.jpeg
+
+#  EXCEPCIÓN: permitir TODO dentro de `data/` 
+!/data/
+!/data/**
+
+#  EXCEPCIÓN: permitir TODO dentro del SDK 
+!/sdk/PSPythonSDK/
+!/sdk/PSPythonSDK/**
