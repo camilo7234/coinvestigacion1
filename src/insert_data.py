@@ -65,78 +65,24 @@ def guardar_mediciones(conn, session_id, measurements):
         limites_ppm = cargar_limites()
 
         for m in measurements:
-            # ppm_estimations puede ser:
-            # - antiguo: {metal: float}
-            # - nuevo: {metal: {'ppm': float, 'pct_of_limit': float, 'note': str}}
-            ppm_raw = m.get('ppm_estimations', {}) or {}
-
-            # Normalizar a dict[metal] -> {'ppm':..., 'pct_of_limit':..., 'note':...}
-            ppm_norm = {}
-            if isinstance(ppm_raw, dict):
-                for metal, v in ppm_raw.items():
-                    if v is None:
-                        ppm_norm[metal] = {'ppm': None, 'pct_of_limit': None, 'note': None}
-                    elif isinstance(v, dict):
-                        ppm_norm[metal] = {
-                            'ppm': v.get('ppm'),
-                            'pct_of_limit': v.get('pct_of_limit'),
-                            'note': v.get('note')
-                        }
-                    else:
-                        # valor numérico antiguo
-                        try:
-                            ppm_val = float(v)
-                        except Exception:
-                            ppm_val = None
-                        ppm_norm[metal] = {'ppm': ppm_val, 'pct_of_limit': None, 'note': None}
-
-            # Determinar classification_group y contamination_level.
-            # Preferimos pct_of_limit para evaluación de excedentes si está presente;
-            # en caso contrario usamos ppm vs límite.
+            # Determinar classification_group en base a ppm_estimations
+            ppm = m.get('ppm_estimations', {})
             excedidos = []
-            max_pct = 0.0
             max_ppm = 0.0
 
-            for metal, d in ppm_norm.items():
+            for metal, valor in ppm.items():
                 limite = limites_ppm.get(metal)
-                pct = None
-                ppmv = None
-                if isinstance(d, dict):
-                    pct = d.get('pct_of_limit')
-                    ppmv = d.get('ppm')
-
-                if pct is not None:
-                    try:
-                        max_pct = max(max_pct, float(pct))
-                    except Exception:
-                        pass
-
-                if ppmv is not None:
-                    try:
-                        max_ppm = max(max_ppm, float(ppmv))
-                    except Exception:
-                        pass
-
-                # Evaluación de excedente: si pct disponible, comparar con 100%%,
-                # si no, comparar ppm con límite absoluto si existe.
-                try:
-                    if pct is not None:
-                        if float(pct) > 100.0:
-                            excedidos.append(metal)
-                    elif limite is not None and ppmv is not None:
-                        if float(ppmv) > float(limite):
-                            excedidos.append(metal)
-                except Exception:
-                    pass
+                if valor is not None:
+                    max_ppm = max(max_ppm, valor)
+                    if limite is not None and valor > limite:
+                        excedidos.append(metal)
 
             if excedidos:
-                classification_group = 1
+                classification_group = 1   # ⚠️ CONTAMINADA
+                contamination_level = max_ppm
             else:
-                classification_group = 0
-
-            # contamination_level se deja como ppm máximo (compatibilidad),
-            # y podemos también guardar max_pct si necesario en tabla summary.
-            contamination_level = max_ppm
+                classification_group = 0   # ✅ SEGURA
+                contamination_level = max_ppm
 
             # Insertar fila en measurements con nuevas columnas
             cur.execute(
@@ -149,10 +95,10 @@ def guardar_mediciones(conn, session_id, measurements):
                 """,
                 (
                     session_id,
-                    m.get('title'),
-                    m.get('timestamp'),
-                    m.get('device_serial'),
-                    m.get('curve_count'),
+                    m['title'],
+                    m['timestamp'],
+                    m['device_serial'],
+                    m['curve_count'],
                     classification_group,
                     contamination_level
                 )
@@ -167,29 +113,18 @@ def guardar_mediciones(conn, session_id, measurements):
                     VALUES (%s, %s, %s)
                     RETURNING id
                     """,
-                    (m_id, curve.get('index'), len(curve.get('potentials', [])))
+                    (m_id, curve['index'], len(curve['potentials']))
                 )
                 curve_id = cur.fetchone()[0]
 
-                data = list(zip(curve.get('potentials', []), curve.get('currents', [])))
-                if data:
-                    cur.executemany(
-                        """
-                        INSERT INTO points (curve_id, potential, current)
-                        VALUES (%s, %s, %s)
-                        """,
-                        [(curve_id, p, c) for p, c in data]
-                    )
-
-            # Insertar summary opcional con max_ppm y max_pct
-            try:
-                cur.execute(
-                    "INSERT INTO measurements_summary(session_id, measurement_id, meas_time, max_ppm, max_pct) VALUES (%s, %s, %s, %s, %s)",
-                    (session_id, m_id, m.get('timestamp'), max_ppm, max_pct)
+                data = list(zip(curve['potentials'], curve['currents']))
+                cur.executemany(
+                    """
+                    INSERT INTO points (curve_id, potential, current)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [(curve_id, p, c) for p, c in data]
                 )
-            except Exception:
-                # Tabla summary puede no existir; no es crítico.
-                pass
 
         conn.commit()
         logging.info("Mediciones, curvas y puntos insertados correctamente con clasificación recalculada.")

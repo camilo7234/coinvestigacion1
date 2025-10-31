@@ -8,6 +8,7 @@ import argparse
 import asyncio
 from tqdm import tqdm
 from device_events import event_manager, DeviceEvent
+from src.canonical import normalize_classification, display_label_from_label
 
 BASE_DIR = os.path.dirname(__file__)
 CONFIG_PATH = os.path.join(BASE_DIR, "config_cliente.json")
@@ -34,6 +35,14 @@ async def enviar_archivo(ruta_archivo):
         "checksum": checksum,
         "serial": serial
     }
+
+    # Normalizar clasificación en el header si fuera proporcionada por algún caller
+    if header.get('clasificacion') is not None:
+        try:
+            header['clasificacion'] = normalize_classification(header.get('clasificacion'))
+            header['display_label'] = display_label_from_label(header['clasificacion'])
+        except Exception:
+            pass
 
     try:
         with socket.create_connection((host, port)) as s:

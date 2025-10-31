@@ -19,6 +19,25 @@ import threading
 import socket
 import json
 import os
+from canonical import normalize_classification, display_label_from_label
+
+
+def ensure_display_label_for_measurement(m: dict) -> dict:
+    """Asegura que el dict de medición tenga `clasificacion` canónica y `display_label`.
+
+    No lanza excepciones; en caso de error devuelve el dict sin modificaciones.
+    """
+    try:
+        if not isinstance(m, dict):
+            return m
+        raw = m.get('clasificacion')
+        if raw is not None:
+            canon = normalize_classification(raw)
+            m['clasificacion'] = canon
+            m['display_label'] = display_label_from_label(canon)
+    except Exception:
+        pass
+    return m
 
 
 class ToolTip:
@@ -471,8 +490,8 @@ class Aplicacion(tk.Tk):
               m.device_serial AS dispositivo,
               m.curve_count AS curvas,
               CASE
-                WHEN m.classification_group = 1 THEN '⚠️ CONTAMINADA'
-                WHEN m.classification_group = 2 THEN '🟡 ANÓMALA'
+                WHEN m.classification_group = 2 THEN '⚠️ CONTAMINADA'
+                WHEN m.classification_group = 1 THEN '🟡 ANÓMALA'
                 ELSE '✅ SEGURA'
               END AS estado,
               COALESCE(ROUND(m.contamination_level::numeric, 2), 0) AS max_ppm,
@@ -515,7 +534,7 @@ class Aplicacion(tk.Tk):
             estado_texto = str(r[5]).upper()
             if "CONTAMINADA" in estado_texto:
                 tag = "alert"
-            elif "ANÓMALA" in estado_texto:
+            elif "ANÓMALA" in estado_texto or "ANOMALA" in estado_texto:
                 tag = "warning"
             else:
                 tag = "safe"

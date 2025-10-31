@@ -1,0 +1,108 @@
+linea 1187 
+var = pca.explained_variance_ratio_.cumsum() * 1000 como yo la deje
+era un 100
+-----------
+linea 1019
+ contamination_level_normalized = contamination_level / 1000 como yo la deje 
+ era un 10000
+
+
+
+
+ control de aguas 966 
+ # ✅ CORRECCIÓN: load_file_internal como método
+    def load_file_internal(self, path):
+        """Procesa y carga archivo .pssession"""
+        print(f"[DEBUG] Procesando archivo: {path}")
+
+        try:
+            from pstrace_session import extraer_y_procesar_sesion_completa
+            print("[DEBUG] Módulo pstrace_session importado")
+
+            # ✅ CORRECCIÓN: Pasar limites_ppm como argumento
+            session_data = extraer_y_procesar_sesion_completa(path, self.limites_ppm)
+            if not session_data:
+                raise ValueError("No se extrajeron datos de la sesión")
+
+            conn = pg8000.connect(**DB_CONFIG)
+            cur = conn.cursor()
+            fname = os.path.basename(path)
+            now = datetime.datetime.now()
+
+            cur.execute(
+                """
+                INSERT INTO sessions
+                  (filename, loaded_at, scan_rate, start_potential,
+                   end_potential, software_version)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    fname,
+                    now,
+                    session_data["session_info"].get("scan_rate"),
+                    session_data["session_info"].get("start_potential"),
+                    session_data["session_info"].get("end_potential"),
+                    session_data["session_info"].get("software_version"),
+                ),
+            )
+            sid = cur.fetchone()[0]
+            print(f"[DEBUG] Sesión insertada. ID: {sid}")
+
+            for idx, measurement in enumerate(session_data["measurements"]):
+                contamination_level = measurement.get("contamination_level", 0.0)
+                
+                # ✅ CORRECCIÓN: Lógica de clasificación con límites realistas
+                # Si contamination_level está en % respecto a límites oficiales:
+                # - Nivel < 100% = SEGURO (no excede límites)
+                # - Nivel 100-200% = MEDIA (1-2x el límite)
+                # - Nivel > 200% = ALTA (>2x el límite)
+                
+                # PERO si los valores vienen en escala de sensor (µA), necesitamos normalizar
+                # Detectar si está en escala errónea (>1000% indica escala incorrecta)
+                if contamination_level > 1000:
+                    # Aplicar factor de normalización (ajusta según tu calibración)
+                    # Ejemplo: si el sensor da valores en rango 0-200 µA para 0-5 ppm
+                    contamination_level_normalized = contamination_level / 1350  # Factor ajustable
+                    print(f"[WARN] Valor fuera de escala: {contamination_level}% → normalizado a {contamination_level_normalized}%")
+                    contamination_level = contamination_level_normalized
+                
+                # Clasificación con límites correctos
+                if contamination_level >= 100:
+                    classification_group = 1  # Alta (>2x límite)
+                elif contamination_level >=65:
+                    classification_group = 2  # Media (1-2x límite)
+                else:
+                    classification_group = 0  # Segura (<límite)
+
+                pca_key = "pca_scores" if "pca_scores" in measurement else "pca_data"
+                pca_scores = measurement.get(pca_key)
+
+                # Convertir a lista Python para pg8000
+                if pca_scores:
+                    if isinstance(pca_scores, str):
+                        pca_scores = json.loads(pca_scores)
+                    pca_scores_array = list(pca_scores) if pca_scores else None
+                else:
+                    pca_scores_array = None
+
+                print(f"[DEBUG] Medición {idx+1} -> nivel={contamination_level:.2f}%, grupo={classification_group}")
+
+                cur.execute(
+                    """
+                    INSERT INTO measurements
+                      (session_id, title, timestamp, device_serial, curve_count,
+                       pca_scores, classification_group, contamination_level)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        sid,
+                        measurement.get("title"),
+                        measurement.get("timestamp"),
+                        measurement.get("device_serial"),
+                        measurement.get("curve_count"),
+                        pca_scores_array,
+                        classification_group,
+                        float(contamination_level),
+                    ),
+                )

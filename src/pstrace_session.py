@@ -30,6 +30,7 @@ import numpy as np
 from pathlib import Path
 import logging
 log = logging.getLogger(__name__)
+from canonical import normalize_classification, display_label_from_label
 
 # ===================================================================================
 # BLOQUE 1: CONFIGURACIÓN INICIAL CRÍTICA Y DEPENDENCIAS .NET
@@ -1008,92 +1009,76 @@ def predecir_con_modelo_entrenado(datos_pca):
                 log.debug(traceback.format_exc())
                 return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
 
-        # === Estrategia de baseline (orden de búsqueda y política conservadora) ===
-        # Preferencia de orígenes: meta['baseline'|'blank_vector'|'baseline_vector'] -> models/baseline.npy -> NONE
-        baseline_vector = None
-        baseline_source = None
-        for key in ("baseline", "blank_vector", "baseline_vector", "baseline_mean_vector"):
-            if key in meta and meta.get(key) is not None:
-                try:
-                    bv = np.array(meta.get(key), dtype=float).reshape(1, -1)
-                    # ajustar baseline si difiere en longitud
-                    if bv.shape[1] != n_features:
-                        if bv.shape[1] < n_features:
-                            pad_w = n_features - bv.shape[1]
-                            bv = np.pad(bv, ((0, 0), (0, pad_w)), 'constant', constant_values=0.0)
-                        else:
-                            bv = bv[:, :n_features]
-                    baseline_vector = bv
-                    baseline_source = f"meta:{key}"
-                    break
-                except Exception:
-                    baseline_vector = None
-                    baseline_source = None
-
-        # Intentar cargar baseline.npy en models/
-        if baseline_vector is None:
-            candidate = MODELS_DIR / "baseline.npy"
-            if candidate.exists():
-                try:
-                    bv = np.load(candidate)
-                    bv = np.array(bv, dtype=float).reshape(1, -1)
-                    if bv.shape[1] != n_features:
-                        if bv.shape[1] < n_features:
-                            pad_w = n_features - bv.shape[1]
-                            bv = np.pad(bv, ((0, 0), (0, pad_w)), 'constant', constant_values=0.0)
-                        else:
-                            bv = bv[:, :n_features]
-                    baseline_vector = bv
-                    baseline_source = "models/baseline.npy"
-                except Exception:
-                    baseline_vector = None
-                    baseline_source = None
-
-        # Política: por seguridad científica, NO restamos la media del propio sample automáticamente.
-        # Solo restamos si hay baseline confiable encontrada y cargada.
-        if baseline_vector is not None:
-            try:
-                X = X - baseline_vector
-                model_meta["used_baseline"] = True
-                model_meta["baseline_source"] = baseline_source
-                log.info("✓ Baseline restado antes del escalado (origen=%s).", baseline_source)
-            except Exception as e:
-                log.warning("⚠ Falló resta de baseline (%s): %s — procediendo sin baseline", baseline_source, str(e))
-                model_meta["used_baseline"] = False
-                model_meta["baseline_source"] = None
-        else:
-            # Comportamiento conservador: NO restar baseline inferida del sample.
-            model_meta["used_baseline"] = False
-            model_meta["baseline_source"] = None
-            log.info("ℹ No se encontró baseline certificada en meta/models — no se resta baseline (política conservadora).")
-
-        # === Escalado con el scaler entrenado (esperado StandardScaler o similar) ===
+        # === Normalización y escalado para PCA (política configurable y trazable) ===
+        # Usamos la función centralizada `normalize_for_pca` en src/preprocess.py. Esta función
+        # aplica (opcional) resta de baseline y luego un método de escalado configurable.
         try:
-            # Preferir scaler.transform (mantener consistencia con entrenamiento)
-            X_scaled = scaler.transform(X)
-        except Exception as e:
-            log.warning("⚠ scaler.transform falló: %s — intentando fallback con mean_/scale_ si están disponibles", str(e))
+            # === Buscar baseline certificada en meta o en models/baseline.npy ===
+            baseline_vector = None
+            baseline_source = None
+            for key in ("baseline", "blank_vector", "baseline_vector", "baseline_mean_vector"):
+                if key in meta and meta.get(key) is not None:
+                    try:
+                        bv = np.array(meta.get(key), dtype=float).reshape(1, -1)
+                        if bv.shape[1] != n_features:
+                            if bv.shape[1] < n_features:
+                                pad_w = n_features - bv.shape[1]
+                                bv = np.pad(bv, ((0, 0), (0, pad_w)), 'constant', constant_values=0.0)
+                            else:
+                                bv = bv[:, :n_features]
+                        baseline_vector = bv
+                        baseline_source = f"meta:{key}"
+                        break
+                    except Exception:
+                        baseline_vector = None
+                        baseline_source = None
+
+            if baseline_vector is None:
+                candidate = MODELS_DIR / "baseline.npy"
+                if candidate.exists():
+                    try:
+                        bv = np.load(candidate)
+                        bv = np.array(bv, dtype=float).reshape(1, -1)
+                        if bv.shape[1] != n_features:
+                            if bv.shape[1] < n_features:
+                                pad_w = n_features - bv.shape[1]
+                                bv = np.pad(bv, ((0, 0), (0, pad_w)), 'constant', constant_values=0.0)
+                            else:
+                                bv = bv[:, :n_features]
+                        baseline_vector = bv
+                        baseline_source = "models/baseline.npy"
+                    except Exception:
+                        baseline_vector = None
+                        baseline_source = None
+
             try:
-                mean_ = getattr(scaler, "mean_", None)
-                scale_ = getattr(scaler, "scale_", None)
-                if mean_ is not None and scale_ is not None:
-                    mean_arr = np.array(mean_, dtype=float).reshape(1, -1)
-                    scale_arr = np.array(scale_, dtype=float).reshape(1, -1)
-                    # Evitar dividir por cero
-                    scale_arr[scale_arr == 0] = 1.0
-                    X_scaled = (X - mean_arr) / scale_arr
-                    log.warning("⚠ Fallback: normalización manual usando mean_/scale_ del scaler")
-                else:
-                    # Último recurso: normalizar por la desviación de la muestra (no ideal)
-                    mu = np.mean(X, axis=0, keepdims=True)
-                    sigma = np.std(X, axis=0, keepdims=True)
-                    sigma[sigma == 0] = 1.0
-                    X_scaled = (X - mu) / sigma
-                    log.warning("⚠ Fallback extremo: z-score calculado desde la muestra (no recomendado)")
-            except Exception as e2:
-                log.error("✗ Fallback de escalado fallido: %s", str(e2))
-                log.debug(traceback.format_exc())
-                return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
+                from preprocess import normalize_for_pca
+            except Exception:
+                # Intento alternativo si se ejecuta como paquete
+                from .preprocess import normalize_for_pca
+
+            # Método de normalización: se puede definir en meta['normalization_method']
+            method = meta.get('normalization_method') or 'use_trained_scaler'
+
+            # Intentar normalizar usando el scaler entrenado (política por defecto)
+            try:
+                X_scaled, norm_meta = normalize_for_pca(X, baseline_vector=baseline_vector, scaler=scaler, method=method)
+                # Actualizar metadatos de modelo para trazabilidad
+                model_meta['used_baseline'] = bool(norm_meta.get('used_baseline'))
+                model_meta['baseline_source'] = baseline_source
+                model_meta['notes'] = (model_meta.get('notes') or '') + f" norm_method:{method}"
+            except ValueError as ve:
+                # Ocurre si method='use_trained_scaler' pero no se proporcionó scaler.
+                log.warning("⚠ normalize_for_pca rechazó el método por falta de artefactos: %s", str(ve))
+                # Forzamos un método alternativo seguro: zscore por columnas (no inventa artefactos)
+                X_scaled, norm_meta = normalize_for_pca(X, baseline_vector=baseline_vector, scaler=None, method='zscore_columns')
+                model_meta['used_baseline'] = bool(norm_meta.get('used_baseline'))
+                model_meta['baseline_source'] = baseline_source
+                model_meta['notes'] = (model_meta.get('notes') or '') + " fallback:zscore_columns"
+
+        except Exception as e:
+            log.error("✗ Error en la normalización para PCA: %s", traceback.format_exc())
+            return {"predicciones": [], "ppm_promedio": None, "model_meta": model_meta}
 
         # === Transformación PCA y predicción con modelo ===
         try:
@@ -1274,15 +1259,24 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
                     # ignorar valores inválidos
                     continue
 
-            # Determinar clasificación textual
+            # Determinar clasificación textual (canónica) usando el máximo % observado
             if nivel_contaminacion >= 120.0:
-                clasificacion = "⚠️ CONTAMINACIÓN SEVERA"
+                raw_label = "CONTAMINADA"
             elif nivel_contaminacion >= 100.0:
-                clasificacion = "⚡ CONTAMINACIÓN MODERADA"
+                raw_label = "ANOMALA"
             elif nivel_contaminacion >= 80.0:
-                clasificacion = "🟡 REQUIERE ATENCIÓN"
+                raw_label = "ANOMALA"
             else:
-                clasificacion = "✅ NIVEL SEGURO"
+                raw_label = "SEGURA"
+
+            # Normalizar a etiqueta canónica y etiqueta de presentación
+            try:
+                clasificacion = normalize_classification(raw_label)
+                display_label = display_label_from_label(clasificacion)
+            except Exception:
+                # Fallback conservador
+                clasificacion = raw_label
+                display_label = raw_label
 
             # Consolidar información completa de la medición
             info_medicion.update({
@@ -1290,7 +1284,9 @@ def extraer_y_procesar_sesion_completa(ruta_archivo, limites_ppm):
                 'pca_scores': datos_pca,
                 'ppm_estimations': estimaciones_ppm,
                 'clasificacion': clasificacion,
+                'display_label': display_label,
                 'contamination_level': nivel_contaminacion,
+                'model_meta': resultado_modelo.get('model_meta', {}),
                 'ppm_modelo': ppm_predicho,
                 'pca_points_count': len(datos_pca) if datos_pca else 0
             })
@@ -1394,6 +1390,8 @@ def extract_session_dict(filepath):
                 'ppm_estimations': ppm_estimations,
                 'clasificacion': clasificacion,
                 'contamination_level': contamination_level
+                ,
+                'model_meta': m.get('model_meta', {})
             })
 
         # 4. Retornar estructura simplificada

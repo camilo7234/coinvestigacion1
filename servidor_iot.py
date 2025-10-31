@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Set
 from src.device_events import event_manager, DeviceEvent
+from src.canonical import normalize_classification, display_label_from_label
 
 # Configuración
 HOST = "0.0.0.0"  # Escucha en todas las interfaces
@@ -77,10 +78,19 @@ async def manejar_streaming(reader, writer, header, client_id):
     device_id = header.get("device_id", client_id)
     dispositivos_conectados.add(device_id)
     
+    # Preparar payload y normalizar clasificación si existe
+    data_payload = {"device_id": device_id}
+    if 'clasificacion' in data_payload:
+        try:
+            data_payload['clasificacion'] = normalize_classification(data_payload.get('clasificacion'))
+            data_payload['display_label'] = display_label_from_label(data_payload['clasificacion'])
+        except Exception:
+            pass
+
     await event_manager.emit_event(DeviceEvent(
         type="stream_started",
         timestamp=datetime.now(),
-        data={"device_id": device_id},
+        data=data_payload,
         device_id=device_id
     ))
 
