@@ -80,10 +80,12 @@ async def manejar_streaming(reader, writer, header, client_id):
     
     # Preparar payload y normalizar clasificación si existe
     data_payload = {"device_id": device_id}
-    if 'clasificacion' in data_payload:
+    # Si el header incluye clasificación, normalizarla y añadir etiqueta de presentación
+    if header.get('clasificacion') is not None:
         try:
-            data_payload['clasificacion'] = normalize_classification(data_payload.get('clasificacion'))
-            data_payload['display_label'] = display_label_from_label(data_payload['clasificacion'])
+            normalized = normalize_classification(header.get('clasificacion'))
+            data_payload['clasificacion'] = normalized
+            data_payload['display_label'] = display_label_from_label(normalized)
         except Exception:
             pass
 

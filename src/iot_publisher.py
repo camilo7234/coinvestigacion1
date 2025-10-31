@@ -72,7 +72,8 @@ class IoTPublisher:
 
     async def _publish(self, topic: str, payload: Dict[str, Any]):
         # For now append to memory and log. Replace with real broker code later.
-        msg = json.dumps(payload, ensure_ascii=False)
+        # Make JSON serialization tolerant to datetimes, numpy types, etc.
+        msg = json.dumps(payload, ensure_ascii=False, default=str)
         self.published.append((topic, msg))
         log.debug("Published to %s: %s", topic, msg[:200])
 

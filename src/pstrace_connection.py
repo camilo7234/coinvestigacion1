@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 from device_events import event_manager, DeviceEvent
+from src.canonical import normalize_classification, display_label_from_label
 # ===================================================================================
 # BLOQUE 1: CONFIGURACIÓN E INICIALIZACIÓN DEL ENTORNO  
 # ===================================================================================
@@ -501,21 +502,100 @@ async def iniciar_medicion_cv_remota(instrumento, method_params: dict) -> dict:
             "buffer_size": len(buffer_datos)
         }
 
+        # Preparar datos PCA tomando el tercer ciclo (si existe)
+        datos_pca = None
+        if len(curvas_normalizadas) >= 3:
+            try:
+                datos_pca = [float(pt['current']) for pt in curvas_normalizadas[2]]
+            except Exception:
+                datos_pca = None
+        elif len(curvas_normalizadas) > 0:
+            try:
+                datos_pca = [float(pt['current']) for pt in curvas_normalizadas[0]]
+            except Exception:
+                datos_pca = None
+
+        # Estimaciones PPM y clasificación
+        estimaciones_ppm = {}
+        nivel_contaminacion = 0.0
+        try:
+            limites = cargar_limites_ppm()
+            if datos_pca:
+                estimaciones_ppm = calcular_estimaciones_ppm(datos_pca, limites)
+        except Exception:
+            estimaciones_ppm = {}
+
+        # Determinar nivel de contaminación global (máx pct_of_limit)
+        try:
+            for metal in ["Cd", "Zn", "Cu", "Cr", "Ni"]:
+                v = estimaciones_ppm.get(metal)
+                pct = None
+                if isinstance(v, dict):
+                    pct = v.get('pct_of_limit') or v.get('pct')
+                else:
+                    try:
+                        pct = float(v) if v is not None else None
+                    except Exception:
+                        pct = None
+                if pct is not None and pct == pct and pct not in (float('inf'), float('-inf')):
+                    if pct > nivel_contaminacion:
+                        nivel_contaminacion = pct
+        except Exception:
+            nivel_contaminacion = 0.0
+
+        # Clasificación canónica
+        raw_label = None
+        if nivel_contaminacion >= 120.0:
+            raw_label = 'CONTAMINADA'
+        elif nivel_contaminacion >= 100.0:
+            raw_label = 'ANOMALA'
+        elif nivel_contaminacion >= 80.0:
+            raw_label = 'ANOMALA'
+        else:
+            raw_label = 'SEGURA'
+
+        try:
+            clasificacion = normalize_classification(raw_label)
+            display_label = display_label_from_label(clasificacion)
+        except Exception:
+            clasificacion = raw_label
+            display_label = raw_label
+
+        # Predicción con modelo entrenado (si está disponible)
+        model_meta = {}
+        ppm_predicho = None
+        if datos_pca:
+            try:
+                from src.pstrace_session import predecir_con_modelo_entrenado
+                resultado_modelo = predecir_con_modelo_entrenado(datos_pca)
+                ppm_predicho = resultado_modelo.get('ppm_promedio')
+                model_meta = resultado_modelo.get('model_meta') or {}
+            except Exception:
+                model_meta = {'notes': 'prediction_not_available'}
+
         measurement = {
-            "title": "CV Streaming",
-            "timestamp": datetime.datetime.now(),
-            "device_serial": device_id,
-            "curve_count": len(curvas_normalizadas),
-            "curves": curvas_normalizadas,
+            'title': 'CV Streaming',
+            'timestamp': datetime.datetime.now(),
+            'device_serial': device_id,
+            'curve_count': len(curvas_normalizadas),
+            'curves': curvas_normalizadas,
+            'pca_scores': datos_pca or [],
+            'ppm_estimations': estimaciones_ppm,
+            'clasificacion': clasificacion,
+            'display_label': display_label,
+            'contamination_level': float(nivel_contaminacion),
+            'model_meta': model_meta,
+            'ppm_modelo': ppm_predicho,
+            'pca_points_count': len(datos_pca) if datos_pca else 0
         }
 
-        # 7) Emitir evento de finalización
+        # Emitir evento de finalización con metadatos enriquecidos
         event_manager.emit_nowait('cv_measurement_complete', measurement, device_id)
 
-        log.info(f"✓ Medición streaming completada: {measurement['curve_count']} curvas")
+        log.info(f"✓ Medición streaming completada: {measurement['curve_count']} curvas, Clasificación={clasificacion}, Nivel={measurement['contamination_level']:.2f}%")
         return {
-            "session_info": session_info,
-            "measurements": [measurement],
+            'session_info': session_info,
+            'measurements': [measurement],
         }
 
     except Exception as e:

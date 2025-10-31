@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 from device_events import event_manager, DeviceEvent
+from src.canonical import normalize_classification, display_label_from_label
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,13 @@ class PalmSensAdapter:
     def start_measurement(self, params: dict):
         # Mapear inicio de medición a event_manager
         log.info("Start measurement with params: %s", params)
+        # Normalizar clasificación en params si se proporcionó
+        try:
+            if isinstance(params, dict) and params.get('clasificacion') is not None:
+                params['clasificacion'] = normalize_classification(params.get('clasificacion'))
+                params['display_label'] = display_label_from_label(params['clasificacion'])
+        except Exception:
+            pass
         event_manager.emit_nowait('cv_measurement_start', params, device_id=self.address or 'UNKNOWN')
 
     def stop_measurement(self):
