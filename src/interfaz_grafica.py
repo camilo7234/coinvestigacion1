@@ -1355,25 +1355,39 @@ class Aplicacion(tk.Tk):
 # ===================================================================================
 # ✅ CORRECCIÓN: load_file_internal como método
 # ===================================================================================
-    
+    # ————— Bloque: Cargar archivo y guardar en BD (corregido) —————
     def load_file(self):
-        """Procesa y carga archivo .pssession"""
-        print(f"[DEBUG] Procesando archivo: {path}")
-
+        """
+        Abre un diálogo para seleccionar un archivo .pssession.
+        Procesa la sesión internamente, guarda en BD y actualiza la interfaz.
+        """
+        print("[DEBUG] load_file() invoked")
+        path = filedialog.askopenfilename(filetypes=[("PSSession", "*.pssession")])
+        if not path:
+            print("[DEBUG] Carga de archivo cancelada por el usuario")
+            return
         try:
-            from pstrace_session import extraer_y_procesar_sesion_completa
-            print("[DEBUG] Módulo pstrace_session importado")
+            print(f"[DEBUG] Procesando archivo: {path}")
 
-            # ✅ CORRECCIÓN: Pasar limites_ppm como argumento
-            session_data = extraer_y_procesar_sesion_completa(path, self.limites_ppm)
-            if not session_data:
+            # 1) Importación corregida
+            from pstrace_session import extract_session_dict, cargar_limites_ppm as cargar_limites
+            print("[DEBUG] Módulo pstrace_session importado correctamente")
+
+            limites = cargar_limites()
+            print(f"[DEBUG] Límites PPM cargados: {list(limites.keys()) if limites else 'No disponibles'}")
+
+            data = extract_session_dict(path)
+            if not data:
                 raise ValueError("No se extrajeron datos de la sesión")
+            print("[DEBUG] Datos de sesión extraídos correctamente")
 
+            # 2) Guardar en la base de datos
             conn = pg8000.connect(**DB_CONFIG)
             cur = conn.cursor()
             fname = os.path.basename(path)
             now = datetime.datetime.now()
 
+            # Insertar session
             cur.execute(
                 """
                 INSERT INTO sessions
@@ -1385,104 +1399,67 @@ class Aplicacion(tk.Tk):
                 (
                     fname,
                     now,
-                    session_data["session_info"].get("scan_rate"),
-                    session_data["session_info"].get("start_potential"),
-                    session_data["session_info"].get("end_potential"),
-                    session_data["session_info"].get("software_version"),
+                    data["session_info"].get("scan_rate"),
+                    data["session_info"].get("start_potential"),
+                    data["session_info"].get("end_potential"),
+                    data["session_info"].get("software_version"),
                 ),
             )
             sid = cur.fetchone()[0]
-            print(f"[DEBUG] Sesión insertada. ID: {sid}")
+            print(f"[DEBUG] Sesión insertada en BD. ID: {sid}")
 
-            for idx, measurement in enumerate(session_data["measurements"]):
-                contamination_level = measurement.get("contamination_level", 0.0)
-                
-                # ✅ CORRECCIÓN: Lógica de clasificación con límites realistas
-                # Si contamination_level está en % respecto a límites oficiales:
-                # - Nivel < 100% = SEGURO (no excede límites)
-                # - Nivel 100-200% = MEDIA (1-2x el límite)
-                # - Nivel > 200% = ALTA (>2x el límite)
-                
-                # PERO si los valores vienen en escala de sensor (µA), necesitamos normalizar
-                # Detectar si está en escala errónea (>1000% indica escala incorrecta)
-                if contamination_level > 1000:
-                    # Aplicar factor de normalización (ajusta según tu calibración)
-                    # Ejemplo: si el sensor da valores en rango 0-200 µA para 0-5 ppm
-                    contamination_level_normalized = contamination_level / 1350  # Factor ajustable
-                    print(f"[WARN] Valor fuera de escala: {contamination_level}% → normalizado a {contamination_level_normalized}%")
-                    contamination_level = contamination_level_normalized
-                
-                # Clasificación con límites correctos
-                if contamination_level >= 100:
-                    classification_group = 1  # Alta (>2x límite)
-                elif contamination_level >=65:
-                    classification_group = 2  # Media (1-2x límite)
-                else:
-                    classification_group = 0  # Segura (<límite)
-
-                pca_key = "pca_scores" if "pca_scores" in measurement else "pca_data"
-                pca_scores = measurement.get(pca_key)
-
-                # Convertir a lista Python para pg8000
-                if pca_scores:
-                    if isinstance(pca_scores, str):
-                        pca_scores = json.loads(pca_scores)
-                    pca_scores_array = list(pca_scores) if pca_scores else None
-                else:
-                    pca_scores_array = None
-
-                print(f"[DEBUG] Medición {idx+1} -> nivel={contamination_level:.2f}%, grupo={classification_group}")
-
+            # Insertar mediciones usando la clave correcta (pca_data o pca_scores)
+            for idx, m in enumerate(data["measurements"]):
+                # Identificar si la clave existe
+                pca_key = "pca_scores" if "pca_scores" in m else "pca_data"
                 cur.execute(
                     """
                     INSERT INTO measurements
-                      (session_id, title, timestamp, device_serial, curve_count,
-                       pca_scores, classification_group, contamination_level)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                      (session_id, title, timestamp, device_serial, curve_count, pca_scores)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (
                         sid,
-                        measurement.get("title"),
-                        measurement.get("timestamp"),
-                        measurement.get("device_serial"),
-                        measurement.get("curve_count"),
-                        pca_scores_array,
-                        classification_group,
-                        float(contamination_level),
+                        m.get("title"),
+                        m.get("timestamp"),
+                        m.get("device_serial"),
+                        m.get("curve_count"),
+                        m.get(pca_key),
                     ),
                 )
+                print(f"[DEBUG] Medición {idx+1} insertada")
 
             conn.commit()
             conn.close()
             print("[DEBUG] Datos guardados en BD")
 
-            self.current_data = pd.DataFrame(session_data["measurements"])
-            self.session_info = session_data["session_info"]
+            # 3) Actualizar UI
+            self.current_data = pd.DataFrame(data["measurements"])
+            self.session_info = data["session_info"]
             self.session_info["session_id"] = sid
-            self.current_session_id = sid
 
-            self.log_message(f"Sesión {sid} cargada correctamente")
-            
+            self.log_message(f"Sesión {sid} cargada")
             self.txt_detail.delete("1.0", "end")
             self.txt_detail.insert("end", json.dumps(self.session_info, indent=2, ensure_ascii=False))
 
+            # Refrescar selector de curvas
             indices = list(self.current_data.index)
             self.cmb_curve["values"] = indices
             if indices:
                 self.cmb_curve.set(indices[0])
 
+            # Mostrar vistas actualizadas
             self.show_curve()
             self.show_pca()
-            self.show_classification()
             self.show_ppm()
             self.load_sessions()
+            print("[DEBUG] UI actualizada")
 
         except Exception as e:
-            print(f"[ERROR] Error en load_file_internal: {e}")
+            print(f"[ERROR] Error en load_file: {str(e)}")
             import traceback
             traceback.print_exc()
-            self.log_message(f"Error: {e}")
-            messagebox.showerror("Error", f"Error al cargar:\n{e}")
+            self.log_message(f"Error carga archivo: {e}")
             
 # ===============
 
