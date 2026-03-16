@@ -1,23 +1,38 @@
 #!/usr/bin/env python
 """
 db_persistence.py
-
 Funciones para guardar sesiones y mediciones en PostgreSQL,
 usando la conexión de db_connection.py
-"""
 
+CORRECCIONES APLICADAS (rama optimizaciones):
+  1. classification_group estaba INVERTIDO:
+       Original: CONTAMINADA=1, ANOMALA=2
+       Correcto:  ANOMALA=1,     CONTAMINADA=2  (según GROUP_MAP en canonical.py)
+  2. La clasificación raw se persistía sin normalizar ("ANÓMALA" != "ANOMALA" en BD).
+       Ahora se normaliza siempre con normalize_classification() antes de insertar.
+  3. Se elimina el bloque if/elif manual y se delega 100% a
+       canonical.classification_group_from_label() como fuente única de verdad.
+"""
 import logging
 from db_connection import conectar_bd
+from canonical import normalize_classification, classification_group_from_label
+
 
 def guardar_sesion_y_mediciones(session_info, measurements):
     """
     Inserta una sesión y sus mediciones en la base de datos.
-    Traduce la clasificación textual a classification_group (0,1,2).
-    """
 
+    Traduce la clasificación textual a classification_group (0, 1, 2)
+    usando canonical.py como única fuente de verdad:
+        0 = SEGURA
+        1 = ANOMALA
+        2 = CONTAMINADA
+
+    Normaliza la cadena de clasificación antes de persistir para evitar
+    inconsistencias por acentos o variantes de mayúsculas ("ANÓMALA" != "ANOMALA").
+    """
     conn = conectar_bd()
     cur = conn.cursor()
-
     try:
         # 1) Insertar sesión
         cur.execute("""
@@ -33,32 +48,43 @@ def guardar_sesion_y_mediciones(session_info, measurements):
             session_info.get('software_version'),
         ))
         session_id = cur.fetchone()[0]
-#=========================================================================================
+
         # 2) Insertar mediciones
-#===================================================================================
         for m in measurements:
-            clas = m.get("clasificacion", "SEGURA")
-            if clas == "CONTAMINADA":
-                classification_group = 1
-            elif clas == "ANÓMALA":
-                classification_group = 2
-            else:
-                classification_group = 0
+            # ---------------------------------------------------------------
+            # CORRECCIÓN: normalizar la clasificación raw antes de cualquier
+            # operación. Esto convierte "ANÓMALA", "anomala", "Anómala", etc.
+            # a la cadena canónica "ANOMALA" que es la que debe ir en la BD.
+            # ---------------------------------------------------------------
+            clas_raw = m.get("clasificacion", "SEGURA")
+            clas = normalize_classification(clas_raw)
+
+            # ---------------------------------------------------------------
+            # CORRECCIÓN: delegar el mapeo numérico a canonical.py.
+            # El bloque if/elif original estaba INVERTIDO:
+            #   CONTAMINADA -> 1  (INCORRECTO, debía ser 2)
+            #   ANÓMALA     -> 2  (INCORRECTO, debía ser 1)
+            # Ahora usa classification_group_from_label() que lee GROUP_MAP:
+            #   SEGURA      -> 0
+            #   ANOMALA     -> 1
+            #   CONTAMINADA -> 2
+            # ---------------------------------------------------------------
+            classification_group = classification_group_from_label(clas)
 
             contamination_level = m.get("contamination_level", 0)
             ppm_estimations = m.get("ppm_estimations") or {}
 
-            # Debug detallado antes de insertar
             logging.debug(
-                "Insertando medición -> clas=%s, group=%s, contamination_level=%.2f, ppm=%s",
-                clas, classification_group, contamination_level, ppm_estimations
+                "Insertando medición -> clas_raw=%s, clas_normalizada=%s, group=%s, "
+                "contamination_level=%.2f, ppm=%s",
+                clas_raw, clas, classification_group, contamination_level, ppm_estimations
             )
 
             cur.execute("""
                 INSERT INTO measurements (
-                  session_id, title, timestamp, device_serial, curve_count,
-                  pca_scores, ppm_estimations, classification_group,
-                  contamination_level, clasificacion
+                    session_id, title, timestamp, device_serial, curve_count,
+                    pca_scores, ppm_estimations, classification_group,
+                    contamination_level, clasificacion
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
                 session_id,
@@ -70,7 +96,7 @@ def guardar_sesion_y_mediciones(session_info, measurements):
                 ppm_estimations,
                 classification_group,
                 contamination_level,
-                clas,
+                clas,          # <-- se persiste la cadena canónica, nunca el raw
             ))
 
         conn.commit()
