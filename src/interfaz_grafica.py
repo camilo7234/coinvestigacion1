@@ -49,7 +49,6 @@ DEFAULT_SETTINGS = {"cycles": [2, 3, 4, 5], "ppm_factor": 1.0, "alert_threshold"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger()
 
-
 # ———————————————————————————————————————————————————————————————————————————
 # CLASES AUXILIARES
 # ———————————————————————————————————————————————————————————————————————————
@@ -77,7 +76,6 @@ class ToolTip:
         if self.tipwin:
             self.tipwin.destroy()
             self.tipwin = None
-
 
 # ———————————————————————————————————————————————————————————————————————————
 # APLICACIÓN PRINCIPAL
@@ -349,8 +347,7 @@ class Aplicacion(tk.Tk):
             self.query_sessions() # Refrescar tabla de consultas
             
             self.log_message(f"✅ Análisis completado con éxito. Sesión ID: {sid}")
-            messagebox.showinfo("Procesamiento Exitoso", f"Los datos han sido analizados y guardados en la BD.
-ID de Sesión: {sid}")
+            messagebox.showinfo("Procesamiento Exitoso", f"Los datos han sido analizados y guardados en la BD. ID de Sesión: {sid}")
         except Exception as e:
             self.log_message(f"❌ ERROR: {e}")
             messagebox.showerror("Error de Procesamiento", str(e))
@@ -451,7 +448,6 @@ ID de Sesión: {sid}")
         self.log_text.insert("end", f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}
 ")
         self.log_text.see("end")
-
 
 if __name__ == "__main__":
     app = Aplicacion()
