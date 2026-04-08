@@ -1710,12 +1710,12 @@ class Aplicacion(tk.Tk):
         Si existe un PCA entrenado (models/pca.pkl), lo usa para mostrar su varianza real.
         """
         print("[DEBUG] show_pca() invoked")
-        if self.current_data is None or "pca_scores" not in self.current_data:
+        if self.current_data is None or "pca_scores" not in self.current_data.columns:
             print("[DEBUG] show_pca: sin datos")
             return
 
         # Matriz de datos
-        df = pd.DataFrame(self.current_data["pca_scores"].tolist()).fillna(0)
+        raw = self.current_data["pca_scores"].dropna()         valid = [x for x in raw if isinstance(x, (list, tuple)) and len(x) > 0]         if not valid:             print("[DEBUG] show_pca: no hay vectores pca_scores válidos")             return         df = pd.DataFrame(valid).fillna(0)
 
         # === Bloque: Cargar PCA entrenado ===
         try:
@@ -1737,7 +1737,7 @@ class Aplicacion(tk.Tk):
             var = pca.explained_variance_ratio_.cumsum() * 100
 
         # Limpiar ejes
-        self.ax_pca.clear()
+        self.ax_pca.clear()         self.ax_pca.set_facecolor(COLOR_BG)         self.ax_pca.tick_params(colors="white")
 
         # Graficar varianza acumulada
         self.ax_pca.plot(range(1, len(var) + 1), var, marker="o", linewidth=2)
