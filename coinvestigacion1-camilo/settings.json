@@ -1,0 +1,10 @@
+{
+  "cycles": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "ppm_factor": 1.0,
+  "alert_threshold": 0.5
+}
