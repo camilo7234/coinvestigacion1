@@ -1715,7 +1715,12 @@ class Aplicacion(tk.Tk):
             return
 
         # Matriz de datos
-        raw = self.current_data["pca_scores"].dropna()         valid = [x for x in raw if isinstance(x, (list, tuple)) and len(x) > 0]         if not valid:             print("[DEBUG] show_pca: no hay vectores pca_scores válidos")             return         df = pd.DataFrame(valid).fillna(0)
+        raw = self.current_data["pca_scores"].dropna()
+        valid = [x for x in raw if isinstance(x, (list, tuple)) and len(x) > 0]
+        if not valid:
+            print("[DEBUG] show_pca: no hay vectores pca_scores validos")
+                    return
+                                    df = pd.DataFrame(valid).fillna(0)
 
         # === Bloque: Cargar PCA entrenado ===
         try:
